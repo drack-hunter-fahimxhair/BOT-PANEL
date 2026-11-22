@@ -774,129 +774,163 @@ def format_time_left(expiry_dt):
 def expire_user_bot(user_id):
     """
     ✅ Expired হলে:
-      1) Running bot process STOP (per-user lock — double call safe)
+      1) Running bot process STOP
       2) DB-তে bot_status="expired"
-      3) Bot file (.py) DELETE
+      3) Bot file (.py) DELETE করবে
     """
-    expiry_lock = _get_expiry_lock(user_id)
-    if not expiry_lock.acquire(blocking=False):
-        # আরেকটা thread ইতিমধ্যে এই user কে expire করছে
-        print(f"[expire] user={user_id} already being expired — skip")
-        return
-
     try:
-        # 1) Monitor stop — supervisor সহ সব বন্ধ
+        # 1) Stop running process
         with monitors_lock:
             if user_id in monitors:
-                m = monitors[user_id]
                 try:
-                    m.supervisor_running = False
-                    m.watchdog_running = False
-                    m.auto_restart_running = False
-                    m._save_desired_state('stopped')
-                    # _stop_process_internal সরাসরি — বাইরে lock নেই
-                    m._stop_process_internal()
-                    print(f"🛑 Expired → Stopped: User {user_id}")
+                    monitors[user_id].watchdog_running = False
+                    monitors[user_id].auto_restart_running = False
+                    monitors[user_id]._save_desired_state('stopped')
+                    monitors[user_id].stop_process(manual=False)
+                    print(f"🛑 Expired → Stop: User {user_id}")
                 except Exception as e:
-                    print(f"[expire] stop error user={user_id}: {e}")
+                    print(f"Stop error: {e}")
                 try:
                     del monitors[user_id]
-                except: pass
+                except:
+                    pass
 
-        # 2) DB থেকে bot_file নাও
+        # 2) Get bot_file from DB
         conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT bot_file FROM users WHERE id=?', (user_id,))
         row = c.fetchone()
         bot_file = row[0] if row else None
 
-        # 3) DB update
-        c.execute('''UPDATE users
-                     SET bot_status="expired",
-                         bot_pid=NULL,
-                         desired_bot_state="stopped"
+        # 3) Update DB status
+        c.execute('''UPDATE users 
+                     SET bot_status="expired", 
+                         bot_pid=NULL, 
+                         desired_bot_state="stopped" 
                      WHERE id=?''', (user_id,))
         conn.commit()
         conn.close()
 
-        # 4) Bot file delete
+        # 4) DELETE bot file (.py)
         if bot_file:
             bot_path = bot_file if os.path.dirname(bot_file) else os.path.join(USER_BOTS_DIR, bot_file)
             if os.path.exists(bot_path):
                 try:
                     os.remove(bot_path)
-                    print(f"🗑️ Deleted expired bot: {bot_path}")
+                    print(f"🗑️ Deleted expired bot file: {bot_path}")
                 except Exception as e:
-                    print(f"[expire] delete error: {e}")
+                    print(f"Delete file error: {e}")
+            # Related files (login variant etc.)
             for suffix in ['_login.py', '.log']:
-                extra = (bot_path.replace('.py', suffix)
-                         if suffix != '.log' else bot_path + '.log')
+                extra = bot_path.replace('.py', suffix) if suffix != '.log' else bot_path + '.log'
                 if os.path.exists(extra):
                     try: os.remove(extra)
                     except: pass
 
         print(f"✅ User {user_id}: Expired → Stopped & file DELETED")
     except Exception as e:
-        print(f"[expire_user_bot] error: {e}")
-    finally:
-        expiry_lock.release()
-
-
-def _safe_expire_user_bot(user_id):
-    """Thread-safe wrapper — supervisor থেকে call এর জন্য।"""
-    t = threading.Thread(target=expire_user_bot, args=(user_id,), daemon=True)
-    t.start()
+        print(f"expire_user_bot error: {e}")
 
 
 def check_all_expired_bots():
     """
-    Background expiry checker — শুধু expire হওয়া bots বন্ধ করে।
-    Per-user lock ব্যবহার করে — supervisor এর সাথে conflict নেই।
+    ✅ Background expiry checker — expired bot STOP + file DELETE করে।
     """
     while True:
         try:
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute('''SELECT id, subscription_expiry, registration_key, bot_status
+            c.execute('''SELECT id, subscription_expiry, registration_key, bot_file, bot_status
                          FROM users WHERE is_admin=0 AND is_agent=0''')
             rows = c.fetchall()
             conn.close()
-
-            for user_id, sub_expiry, reg_key, bot_status in rows:
-                # Already expired in DB → skip
-                if bot_status == 'expired':
-                    continue
-
+            for user_id, sub_expiry, reg_key, bot_file, bot_status in rows:
                 expiry_val = sub_expiry
                 if not expiry_val and reg_key:
+                    conn = get_db_connection()
+                    cc = conn.cursor()
+                    cc.execute('SELECT expiry_date FROM keys WHERE key=?', (reg_key,))
+                    kr = cc.fetchone()
+                    conn.close()
+                    if kr: expiry_val = kr[0]
+                if expiry_val:
                     try:
-                        conn2 = get_db_connection()
-                        cc = conn2.cursor()
-                        cc.execute('SELECT expiry_date FROM keys WHERE key=?', (reg_key,))
-                        kr = cc.fetchone()
-                        conn2.close()
-                        if kr: expiry_val = kr[0]
+                        expiry_dt = datetime.fromisoformat(expiry_val)
+                        if datetime.now() > expiry_dt:
+                            if bot_status == 'expired':
+                                continue
+                            print(f"\n⏰ EXPIRY DETECTED → User {user_id}")
+                            expire_user_bot(user_id)
                     except: pass
-
-                if not expiry_val:
-                    continue  # No expiry = unlimited, skip
-
-                try:
-                    expiry_dt = datetime.fromisoformat(expiry_val)
-                    if datetime.now() > expiry_dt:
-                        print(f"\n⏰ BG EXPIRY DETECTED → User {user_id}")
-                        # expire_user_bot এর lock check করে — double call safe
-                        _safe_expire_user_bot(user_id)
-                except Exception:
-                    pass
-
         except Exception as e:
-            print(f"[BG expiry] error: {e}")
-
-        time.sleep(30)  # 30s — supervisor নিজে 5s এ check করে, এটা backup মাত্র
+            print(f"BG check error: {e}")
+        time.sleep(15)
 
 
 threading.Thread(target=check_all_expired_bots, daemon=True).start()
+
+
+def global_bot_keepalive():
+    """
+    Panel-level 24/7 supervisor:
+    Every few seconds, ensure every non-expired user with desired_bot_state=running
+    has a live process. Recreates monitor if needed and starts the bot file.
+    Does NOT start bots that are expired, admin-disabled, or globally stopped
+    (unless force_active).
+    """
+    time.sleep(8)  # let app finish startup
+    while True:
+        try:
+            if get_global_stop():
+                time.sleep(8)
+                continue
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("""SELECT id, bot_file, desired_bot_state, bot_disabled_by_admin, bot_force_active
+                         FROM users WHERE is_admin=0 AND is_agent=0
+                           AND bot_file IS NOT NULL AND bot_file != ''""")
+            rows = c.fetchall()
+            conn.close()
+            for user_id, bot_file, desired, disabled, force_active in rows:
+                try:
+                    if desired and desired != 'running':
+                        continue
+                    if disabled:
+                        continue
+                    sub = check_subscription_status(user_id)
+                    if sub['status'] == 'expired':
+                        continue
+                    # Limit check for NEW starts only (if already live, skip)
+                    path = bot_file if os.path.isabs(bot_file) else os.path.join(USER_BOTS_DIR, bot_file)
+                    if not os.path.exists(path):
+                        continue
+                    m = get_monitor(user_id)
+                    if not m:
+                        continue
+                    # Force desired_state running if DB says so
+                    if m.desired_state != 'running':
+                        m.desired_state = 'running'
+                    alive = False
+                    try:
+                        if m.process is not None and m.process.poll() is None:
+                            alive = True
+                    except Exception:
+                        alive = False
+                    if alive:
+                        continue
+                    # Dead → start (can_start respects limit/disable/expiry)
+                    can, reason = m.can_start()
+                    if can:
+                        print(f"💚 KEEPALIVE start user={user_id}")
+                        m.start_process()
+                except Exception as e:
+                    print(f"[keepalive] user={user_id} err: {e}")
+        except Exception as e:
+            print(f"[keepalive] loop err: {e}")
+        time.sleep(8)
+
+
+threading.Thread(target=global_bot_keepalive, daemon=True).start()
 
 
 def update_bot_bio(uid, password, username=None, bio_text=None):
@@ -932,24 +966,8 @@ def update_bot_bio(uid, password, username=None, bio_text=None):
 
 
 # ============================================================
-#  PROCESS MONITOR  —  24/7 BULLETPROOF VERSION
-#  ✅ Bot মেয়াদ শেষ না হওয়া পর্যন্ত কখনো বন্ধ হবে না
-#  ✅ Crash হলে 5 সেকেন্ডের মধ্যে auto-restart
-#  ✅ Double-stop / race condition সম্পূর্ণ দূর করা হয়েছে
-#  ✅ Global stop / admin disable → শুধু status দেখাবে, restart বন্ধ রাখবে
+#  PROCESS MONITOR
 # ============================================================
-
-# Per-user expiry lock — একই user কে দুইবার expire করা আটকায়
-_expiry_locks = {}
-_expiry_locks_lock = threading.Lock()
-
-def _get_expiry_lock(user_id):
-    with _expiry_locks_lock:
-        if user_id not in _expiry_locks:
-            _expiry_locks[user_id] = threading.Lock()
-        return _expiry_locks[user_id]
-
-
 class ProcessMonitor:
     def __init__(self, user_id, bot_file_path):
         self.user_id = user_id
@@ -1001,18 +1019,15 @@ class ProcessMonitor:
         self.auto_restart_count = 0
         self.last_auto_restart_at = 0
 
-        # ✅ একটাই supervisor thread — 24/7 uptime guarantee
-        self.supervisor_running = True
-        self.supervisor_thread = threading.Thread(target=self._supervisor_loop, daemon=True)
-        self.supervisor_thread.start()
-
-        # Legacy aliases — পুরনো code যারা এই নাম use করে তাদের জন্য
+        # Auto-restart supervisor (keeps bot up when desired_state=running)
         self.auto_restart_running = True
-        self.watchdog_running = True
+        self.auto_restart_thread = threading.Thread(target=self._auto_restart_loop, daemon=True)
+        self.auto_restart_thread.start()
 
-    # ------------------------------------------------------------------
-    #  DESIRED STATE
-    # ------------------------------------------------------------------
+        self.watchdog_running = True
+        self.watchdog_thread = threading.Thread(target=self._expiry_watchdog, daemon=True)
+        self.watchdog_thread.start()
+
     def _load_desired_state(self):
         try:
             conn = get_db_connection()
@@ -1028,7 +1043,6 @@ class ProcessMonitor:
 
     def _save_desired_state(self, state):
         self.desired_state = state
-        self.auto_restart_running = (state == 'running')
         try:
             conn = get_db_connection()
             c = conn.cursor()
@@ -1038,160 +1052,93 @@ class ProcessMonitor:
         except Exception as e:
             print(f"[desired_state] save error user={self.user_id}: {e}")
 
-    # ------------------------------------------------------------------
-    #  ✅ SINGLE SUPERVISOR — সব কিছু এক জায়গায়, race condition নেই
-    # ------------------------------------------------------------------
-    def _supervisor_loop(self):
+    def _auto_restart_loop(self):
+        """Keep bot alive 24/7 while desired_state=running and not expired.
+        Only stops permanently on: expiry, manual Stop, admin disable, global stop.
         """
-        24/7 supervisor:
-        • প্রতি 5 সেকেন্ডে process alive কিনা check করে
-        • Dead হলে সাথে সাথে restart করে (desired_state=running হলে)
-        • Expiry check করে — শুধু expire হলেই বন্ধ করে
-        • Admin disable / global stop → restart বন্ধ, status update
-        • Double-restart আটকাতে restart_lock ব্যবহার করে
-        """
-        restart_lock = threading.Lock()
-        consecutive_fails = 0
-
-        while self.supervisor_running:
+        while self.auto_restart_running:
             try:
-                time.sleep(5)
-
-                if not self.supervisor_running:
+                time.sleep(5)  # check every 5s for near-instant recovery
+                if not self.auto_restart_running:
                     break
-
-                # ── ১. Manual stop → শুধু wait করো ──────────────────
+                # Manual stop → do not restart
                 if self.desired_state != 'running':
                     continue
-
-                # ── ২. Process alive check ───────────────────────────
+                # Still alive?
                 alive = False
                 try:
                     if self.process is not None and self.process.poll() is None:
                         alive = True
                 except Exception:
                     alive = False
-
                 if alive:
-                    # Process চলছে → সব ঠিকঠাক
-                    self.is_running = True
-                    consecutive_fails = 0
+                    if not self.is_running:
+                        self.is_running = True
                     continue
-
-                # ── ৩. Process dead — restart দরকার ─────────────────
+                # Process dead but should be running — restart
                 self.is_running = False
-
-                # ── ৪. Expiry check (শুধু dead হলেই check) ───────────
-                expired = self._check_expiry_now()
-                if expired:
-                    print(f"⏰ SUPERVISOR: User {self.user_id} মেয়াদ শেষ → Bot বন্ধ")
-                    self.supervisor_running = False
-                    self.watchdog_running = False
-                    self.auto_restart_running = False
-                    _safe_expire_user_bot(self.user_id)
-                    break
-
-                # ── ৫. Admin disable / Global stop check ─────────────
-                block_reason = self._check_block_reason()
-                if block_reason:
-                    with self.lock:
-                        if block_reason == 'admin_disabled':
-                            self.bot_status = "🔴 BLOCKED BY ADMIN"
-                        elif block_reason == 'global_stop':
+                can, reason = self.can_start()
+                if not can:
+                    if reason == 'limit_reached':
+                        with self.lock:
+                            self.bot_status = "🔴 LIMIT FULL"
+                    elif reason == 'global_stop':
+                        with self.lock:
                             self.bot_status = "🔴 GLOBAL STOP"
-                    # Blocked → restart করবো না, কিন্তু loop চলবে
-                    # যাতে block উঠলে সাথে সাথে restart হয়
-                    time.sleep(10)
+                    elif reason == 'admin_disabled':
+                        with self.lock:
+                            self.bot_status = "🔴 BLOCKED"
+                    elif reason == 'expired':
+                        with self.lock:
+                            self.bot_status = "🔴 EXPIRED"
                     continue
-
-                # ── ৬. Consecutive fail backoff ──────────────────────
-                if consecutive_fails > 0:
-                    wait = min(consecutive_fails * 3, 30)  # max 30s backoff
-                    time.sleep(wait)
-
-                # ── ৭. Restart (lock দিয়ে — double restart আটকাও) ───
-                if not restart_lock.acquire(blocking=False):
-                    continue  # আরেকটা restart চলছে
-
-                try:
-                    consecutive_fails += 1
-                    self.auto_restart_count += 1
-                    self.last_restart_reason = 'AUTO_RESTART'
-                    print(f"🔄 SUPERVISOR AUTO-RESTART user={self.user_id} "
-                          f"attempt={self.auto_restart_count} consecutive_fails={consecutive_fails}")
-                    ok = self._do_start_process()
-                    if ok:
-                        consecutive_fails = 0
-                        print(f"✅ SUPERVISOR RESTART OK user={self.user_id}")
-                    else:
-                        print(f"⚠️ SUPERVISOR RESTART FAILED user={self.user_id}")
-                finally:
-                    restart_lock.release()
-
+                # Short backoff to avoid tight crash loops (still aggressive)
+                now = time.time()
+                if now - self.last_auto_restart_at < 3:
+                    continue
+                self.last_auto_restart_at = now
+                self.auto_restart_count += 1
+                self.last_restart_reason = 'AUTO_RESTART'
+                print(f"🔄 AUTO-RESTART user={self.user_id} count={self.auto_restart_count}")
+                self.start_process()
             except Exception as e:
-                print(f"[supervisor] user={self.user_id} error: {e}")
-
-    def _check_expiry_now(self):
-        """True মানে মেয়াদ শেষ — বন্ধ করতে হবে।"""
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT subscription_expiry, registration_key, is_admin, is_agent FROM users WHERE id=?',
-                      (self.user_id,))
-            row = c.fetchone()
-            if not row:
-                conn.close()
-                return False
-            # Admin / agent কখনো expire হয় না
-            if row[2] or row[3]:
-                conn.close()
-                return False
-            expiry_val = row[0]
-            if not expiry_val and row[1]:
-                c.execute('SELECT expiry_date FROM keys WHERE key=?', (row[1],))
-                kr = c.fetchone()
-                if kr:
-                    expiry_val = kr[0]
-            conn.close()
-            if not expiry_val:
-                return False  # No expiry = unlimited
-            expiry_dt = datetime.fromisoformat(expiry_val)
-            return datetime.now() > expiry_dt
-        except Exception as e:
-            print(f"[expiry_check] user={self.user_id}: {e}")
-            return False  # Error হলে safe side = expire করবো না
-
-    def _check_block_reason(self):
-        """
-        None = restart করো।
-        'admin_disabled' / 'global_stop' = restart করো না।
-        (Expiry এখানে নেই — আলাদাভাবে handle)
-        """
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT bot_disabled_by_admin, bot_force_active FROM users WHERE id=?',
-                      (self.user_id,))
-            row = c.fetchone()
-            conn.close()
-            if row and row[0]:
-                return 'admin_disabled'
-            if get_global_stop():
-                if not (row and row[1]):
-                    return 'global_stop'
-        except Exception:
-            pass
-        return None
-
-    # Legacy watchdog — supervisor এ merge হয়েছে, এটা no-op
-    def _auto_restart_loop(self):
-        pass
+                print(f"[auto_restart] user={self.user_id} error: {e}")
 
     def _expiry_watchdog(self):
-        pass
+        while self.watchdog_running:
+            try:
+                time.sleep(10)
+                if not self.watchdog_running:
+                    break
+                if not self.is_running:
+                    continue
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('SELECT subscription_expiry, registration_key FROM users WHERE id=?', (self.user_id,))
+                row = c.fetchone()
+                expiry_val = None
+                if row:
+                    expiry_val = row[0]
+                    if not expiry_val and row[1]:
+                        c.execute('SELECT expiry_date FROM keys WHERE key=?', (row[1],))
+                        kr = c.fetchone()
+                        if kr: expiry_val = kr[0]
+                conn.close()
+                if expiry_val:
+                    try:
+                        expiry_dt = datetime.fromisoformat(expiry_val)
+                        if datetime.now() > expiry_dt:
+                            print(f"\n⏰ WATCHDOG: User {self.user_id} EXPIRED → Killing process + deleting file")
+                            self.watchdog_running = False
+                            self.auto_restart_running = False
+                            self.stop_process(manual=False)
+                            expire_user_bot(self.user_id)
+                            break
+                    except: pass
+            except Exception as e:
+                print(f"Watchdog error: {e}")
 
     def can_start(self):
-        """Manual start-এর জন্য check। Supervisor এটা use করে না।"""
         sub = check_subscription_status(self.user_id)
         if sub['status'] == 'expired':
             return False, "expired"
@@ -1204,10 +1151,13 @@ class ProcessMonitor:
             if row and row[0]:
                 return False, "admin_disabled"
             if get_global_stop():
+                # Only force_active bots may start during global stop
                 if not (row and row[1]):
                     return False, "global_stop"
         except Exception:
             pass
+
+        # Concurrent running bots limit (owner-set). -1 = unlimited
         max_b = get_max_running_bots()
         if max_b >= 0:
             already_live = False
@@ -1397,144 +1347,112 @@ class ProcessMonitor:
             if p in l: return True
         return False
 
-    # ------------------------------------------------------------------
-    #  ✅ CORE PROCESS START — একটাই implementation, সবাই এটা call করে
-    # ------------------------------------------------------------------
-    def _do_start_process(self):
-        """
-        Process launch করে। Lock ছাড়া — caller নিজে lock ধরবে দরকারে।
-        Returns True if process started successfully.
-        """
-        # Already alive?
-        try:
-            if self.process is not None and self.process.poll() is None:
-                self.is_running = True
-                return True
-        except Exception:
-            pass
-
-        # পুরনো process cleanup
-        if self.process:
-            try: self.process.kill()
-            except: pass
-            self.process = None
-
-        if not os.path.exists(self.process_name):
-            print(f"[START] File not found: {self.process_name} user={self.user_id}")
-            self.is_running = False
-            self.bot_status = "🔴 FILE MISSING"
-            return False
-
-        try:
-            env_copy = os.environ.copy()
-            env_copy['TERM'] = 'xterm'
-            env_copy['PYTHONUNBUFFERED'] = '1'
-            env_copy['PYTHONIOENCODING'] = 'utf-8'
-            env_copy['LANG'] = 'en_US.UTF-8'
-            env_copy['LC_ALL'] = 'en_US.UTF-8'
-
-            self.process = subprocess.Popen(
-                [sys.executable, "-u", self.process_name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True, bufsize=1,
-                universal_newlines=True, errors='replace',
-                cwd=USER_BOTS_DIR,
-                env=env_copy,
-                start_new_session=True,
-            )
-            self.is_running = True
-            self.start_time = datetime.now()
-            self.bot_status = "🟢 ACTIVE & ONLINE"
-
-            try:
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute('UPDATE users SET bot_status="running", bot_pid=? WHERE id=?',
-                          (self.process.pid, self.user_id))
-                conn.commit(); conn.close()
-            except: pass
-
-            # Output reader thread
-            proc_ref = self.process
-            def enqueue(p=proc_ref):
-                try:
-                    for line in iter(p.stdout.readline, ''):
-                        if line:
-                            ts = datetime.now().strftime('%H:%M:%S')
-                            self.output_queue.put(f"[{ts}] {line.rstrip()}")
-                            try:
-                                self.process_line(line, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                            except Exception as pe:
-                                print(f"[process_line error] {pe}")
-                except Exception as e:
-                    print(f"[enqueue error user={self.user_id}] {e}")
-
-            self.output_thread = threading.Thread(target=enqueue, daemon=True)
-            self.output_thread.start()
-
-            # Quick crash check
-            time.sleep(0.5)
-            if self.process.poll() is not None:
-                exit_code = self.process.returncode
-                print(f"⚠️ Immediate crash exit={exit_code} user={self.user_id}")
-                self.is_running = False
-                self.bot_status = "🔴 CRASHED"
-                self.process = None
-                return False
-
-            return True
-
-        except Exception as e:
-            print(f"[START ERROR] user={self.user_id}: {e}")
-            self.is_running = False
-            self.bot_status = "🔴 START ERROR"
-            with self.lock:
-                self.output_lines.append(f"[START ERROR] {e}")
-            return False
-
     def start_process(self):
-        """Manual start (user/owner panel থেকে call)."""
         can, reason = self.can_start()
         if not can:
             with self.lock:
                 self.is_running = False
-                status_map = {
-                    'limit_reached': "🔴 LIMIT FULL",
-                    'expired':       "🔴 EXPIRED",
-                    'global_stop':   "🔴 GLOBAL STOP",
-                    'admin_disabled':"🔴 BLOCKED",
-                }
-                self.bot_status = status_map.get(reason, "🔴 BLOCKED")
+                if reason == 'limit_reached':
+                    self.bot_status = "🔴 LIMIT FULL"
+                elif reason == 'expired':
+                    self.bot_status = "🔴 EXPIRED"
+                elif reason == 'global_stop':
+                    self.bot_status = "🔴 GLOBAL STOP"
+                else:
+                    self.bot_status = "🔴 BLOCKED"
             print(f"⛔ Cannot start user {self.user_id}: {reason}")
             return False
 
-        self._save_desired_state('running')
-        return self._do_start_process()
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                self._save_desired_state('running')
+                return True
+            if self.process:
+                self._stop_process_internal()
+            if not os.path.exists(self.process_name):
+                print(f"Error: {self.process_name} not found")
+                return False
 
-    # ------------------------------------------------------------------
-    #  STOP — process kill + DB update
-    # ------------------------------------------------------------------
+            try:
+                env_copy = os.environ.copy()
+                env_copy['TERM'] = 'xterm'
+                env_copy['PYTHONUNBUFFERED'] = '1'
+                env_copy['PYTHONIOENCODING'] = 'utf-8'
+                env_copy['LANG'] = 'en_US.UTF-8'
+                env_copy['LC_ALL'] = 'en_US.UTF-8'
+
+                self.process = subprocess.Popen(
+                    [sys.executable, "-u", self.process_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                    universal_newlines=True, errors='replace',
+                    cwd=USER_BOTS_DIR,
+                    env=env_copy,
+                    start_new_session=True,
+                )
+                self.is_running = True
+                self.start_time = datetime.now()
+                self.bot_status = "🟢 ACTIVE & ONLINE"
+                self._save_desired_state('running')
+
+                try:
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute('UPDATE users SET bot_status="running", bot_pid=? WHERE id=?',
+                              (self.process.pid, self.user_id))
+                    conn.commit(); conn.close()
+                except: pass
+
+                def enqueue():
+                    try:
+                        for line in iter(self.process.stdout.readline, ''):
+                            if line:
+                                ts = datetime.now().strftime('%H:%M:%S')
+                                self.output_queue.put(f"[{ts}] {line.rstrip()}")
+                                try:
+                                    self.process_line(line, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                                except Exception as pe:
+                                    print(f"[process_line error] {pe}")
+                    except Exception as e:
+                        print(f"[enqueue error user={self.user_id}] {e}")
+
+                self.output_thread = threading.Thread(target=enqueue, daemon=True)
+                self.output_thread.start()
+
+                time.sleep(0.3)
+                if self.process.poll() is not None:
+                    exit_code = self.process.returncode
+                    print(f"⚠️ Bot process died immediately (exit={exit_code}) for user {self.user_id}")
+                    self.is_running = False
+                    self.bot_status = "🔴 CRASHED"
+                    return False
+
+                return True
+            except Exception as e:
+                self.output_lines.append(f"Error: {str(e)}")
+                self.is_running = False
+                return False
+
     def _stop_process_internal(self):
-        """Process kill করে। Lock ছাড়া — caller lock ধরবে।"""
         if self.process:
-            pid = None
-            try: pid = self.process.pid
-            except: pass
             try:
                 try:
-                    pgid = os.getpgid(pid)
+                    pgid = os.getpgid(self.process.pid)
                     os.killpg(pgid, signal.SIGTERM)
                     time.sleep(0.3)
-                    try: os.killpg(pgid, signal.SIGKILL)
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
                     except: pass
-                except: pass
+                except:
+                    pass
+
+                p = psutil.Process(self.process.pid)
+                for child in p.children(recursive=True):
+                    try: child.kill()
+                    except: pass
                 try:
-                    p = psutil.Process(pid)
-                    for child in p.children(recursive=True):
-                        try: child.kill()
-                        except: pass
                     p.kill(); p.wait(timeout=3)
                 except: pass
             except:
@@ -1551,30 +1469,21 @@ class ProcessMonitor:
         except: pass
 
     def stop_process(self, manual=True):
-        """
-        manual=True  → user নিজে বন্ধ করেছে, supervisor restart করবে না।
-        manual=False → system বন্ধ করেছে (expire/rebuild), supervisor চলবে।
-        """
         with self.lock:
             if manual:
                 self._save_desired_state('stopped')
-                self.supervisor_running = False   # supervisor থামাও
-                self.auto_restart_running = False
-                self.watchdog_running = False
-                print(f"🛑 MANUAL STOP: user={self.user_id}")
+                print(f"🛑 MANUAL STOP: user {self.user_id} → desired_state=stopped")
             self._stop_process_internal()
 
     def restart_logic(self):
-        """Manual restart — supervisor চালু রাখো।"""
         self._save_desired_state('running')
         self.last_restart_reason = 'MANUAL_RESTART'
-        with self.lock:
-            self._stop_process_internal()
-        time.sleep(1)
-        ok = self._do_start_process()
-        if ok:
+        self.stop_process(manual=False)
+        time.sleep(2)
+        s = self.start_process()
+        if s:
             with self.lock: self.restart_count += 1
-        return ok
+        return s
 
     def update_logs(self):
         new_logs = []
@@ -1636,10 +1545,8 @@ class ProcessMonitor:
         return True
 
     def hard_reset(self):
-        """Full reset — log clear করে fresh start।"""
-        # Process বন্ধ করো কিন্তু supervisor চলতে দাও
+        self.stop_process()
         with self.lock:
-            self._stop_process_internal()
             self.restart_count = 0
             self.output_lines = []; self.full_history = []
             self.error_lines = []; self.message_info_lines = []
@@ -1652,17 +1559,66 @@ class ProcessMonitor:
             self.last_nickname = "N/A"; self.last_message = "N/A"; self.last_pfp_url = "N/A"
         self._save_desired_state('running')
         self.last_restart_reason = 'HARD_RESET'
-        # Supervisor re-enable করো (manual stop থেকে reset)
-        if not self.supervisor_running:
-            self.supervisor_running = True
-            self.supervisor_thread = threading.Thread(target=self._supervisor_loop, daemon=True)
-            self.supervisor_thread.start()
-        return self._do_start_process()
+        return self._force_start_process()
 
     def _force_start_process(self):
-        """Legacy alias → _do_start_process."""
-        self._save_desired_state('running')
-        return self._do_start_process()
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return True
+            if self.process:
+                self._stop_process_internal()
+            if not os.path.exists(self.process_name):
+                print(f"Error: {self.process_name} not found")
+                return False
+            try:
+                env_copy = os.environ.copy()
+                env_copy['TERM'] = 'xterm'
+                env_copy['PYTHONUNBUFFERED'] = '1'
+                env_copy['PYTHONIOENCODING'] = 'utf-8'
+                env_copy['LANG'] = 'en_US.UTF-8'
+                env_copy['LC_ALL'] = 'en_US.UTF-8'
+
+                self.process = subprocess.Popen(
+                    [sys.executable, "-u", self.process_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                    universal_newlines=True, errors='replace',
+                    cwd=USER_BOTS_DIR,
+                    env=env_copy,
+                    start_new_session=True,
+                )
+                self.is_running = True
+                self.start_time = datetime.now()
+                self.bot_status = "🟢 ACTIVE & ONLINE"
+                try:
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute('UPDATE users SET bot_status="running", bot_pid=? WHERE id=?',
+                              (self.process.pid, self.user_id))
+                    conn.commit(); conn.close()
+                except: pass
+
+                def enqueue():
+                    try:
+                        for line in iter(self.process.stdout.readline, ''):
+                            if line:
+                                ts = datetime.now().strftime('%H:%M:%S')
+                                self.output_queue.put(f"[{ts}] {line.rstrip()}")
+                                try:
+                                    self.process_line(line, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                                except Exception as pe:
+                                    print(f"[process_line error] {pe}")
+                    except Exception as e:
+                        print(f"[enqueue error user={self.user_id}] {e}")
+
+                self.output_thread = threading.Thread(target=enqueue, daemon=True)
+                self.output_thread.start()
+                return True
+            except Exception as e:
+                self.output_lines.append(f"Error: {str(e)}")
+                return False
 
 
 # ============================================================
@@ -1688,13 +1644,9 @@ def get_monitor(user_id, create_only=True):
     if not os.path.exists(bot_file):
         return None
     monitor = ProcessMonitor(user_id, bot_file)
-    monitor.supervisor_running = True  # ✅ 24/7 supervisor
     with monitors_lock:
         if user_id in monitors:
-            # Race condition — আরেকটা thread আগেই তৈরি করে ফেলেছে
-            # নতুনটা বন্ধ করো, পুরনোটা return করো
             try:
-                monitor.supervisor_running = False
                 monitor.auto_restart_running = False
                 monitor.watchdog_running = False
             except Exception:
@@ -1749,7 +1701,6 @@ def startup_launch_all_bots():
                     if existing.is_running and existing.process and existing.process.poll() is None:
                         continue
             m = ProcessMonitor(user_id, path)
-            m.supervisor_running = True  # ✅ 24/7 supervisor চালু
             with monitors_lock:
                 monitors[user_id] = m
             m.last_restart_reason = 'SERVER_STARTUP'
@@ -3845,6 +3796,65 @@ OWNER_BIO_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 
 
 # ============================================================
+#  NOTICES HTML (Global + Login popup)
+# ============================================================
+OWNER_NOTICES_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Notices - MAHIR</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+<style>''' + COMMON_CSS + '''</style></head><body>
+<div class="container">
+  <div class="card header">
+    <h1><i class="fas fa-bell"></i> Notice Settings</h1>
+    <div class="flex">
+      <a href="/owner/dashboard" class="btn btn-clear btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <a href="/owner/modules" class="btn btn-primary btn-sm"><i class="fas fa-puzzle-piece"></i> Modules</a>
+      <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
+      <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
+      <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
+    </div>
+  </div>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}{% for cat, msg in messages %}
+  <div class="alert {{ cat }}"><i class="fas fa-{{ 'check-circle' if cat=='success' else 'exclamation-circle' }}"></i> {{ msg }}</div>
+  {% endfor %}{% endif %}{% endwith %}
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice</div>
+    <p style="color:var(--muted);font-size:.85rem;margin-bottom:10px;">User panel-এ দেখানো গ্লোবাল নোটিশ।</p>
+    <form method="POST" action="/owner/set_global_notice">
+      <textarea name="notice_text" rows="4" style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ global_notice }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
+        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
+    <div class="flex" style="margin-bottom:12px;">
+      <label style="color:var(--gold2);font-weight:600;">Status:</label>
+      {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
+      {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
+    </div>
+    <form method="POST" action="/owner/set_user_login_notice">
+      <textarea name="notice_text" rows="4" placeholder="Type notice text here..." style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ login_notice_text }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
+        {% if login_notice_enabled %}
+        <button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
+        {% else %}
+        <button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+</div>
+''' + VOICE_HELPER_JS + '''
+</body></html>'''
+
+
+# ============================================================
 #  LINKS & APP SETTINGS HTML
 # ============================================================
 OWNER_LINKS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Links &amp; App - MAHIR</title>
@@ -4201,6 +4211,7 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
       <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
       <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
+      <a href="/owner/notices" class="btn btn-info btn-sm"><i class="fas fa-bell"></i> Notices</a>
       <form method="POST" action="/owner/reset_all_bots" onsubmit="return confirm('⚠️ Reset All?');" style="display:inline;"><button type="submit" class="btn btn-reset btn-sm"><i class="fas fa-sync-alt"></i> Reset All</button></form>
       {% if global_stop %}
         <form method="POST" action="/owner/start_all_bots" style="display:inline;"><button type="submit" class="btn btn-success btn-sm"><i class="fas fa-play"></i> Resume All</button></form>
@@ -4240,34 +4251,6 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <div class="stat-card"><div class="stat-label">RAM</div><div class="stat-value">{{ ram_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ ram_percent }}%;"></div></div></div>
       <div class="stat-card"><div class="stat-label">Disk</div><div class="stat-value">{{ disk_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ disk_percent }}%;"></div></div></div>
     </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice Settings</div>
-    <form method="POST" action="/owner/set_global_notice">
-      <textarea name="notice_text" rows="3">{{ global_notice }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
-        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
-    <form method="POST" action="/owner/set_user_login_notice">
-      <div class="flex" style="margin-bottom:12px;">
-        <label style="color:var(--gold2);font-weight:600;">Status:</label>
-        {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
-        {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
-      </div>
-      <textarea name="notice_text" rows="4" placeholder="Type notice text here...">{{ login_notice_text }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
-        {% if login_notice_enabled %}<button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
-        {% else %}<button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>{% endif %}
-      </div>
-    </form>
   </div>
 
   <div class="card">
@@ -6748,6 +6731,20 @@ body{{background:#07070f;color:#e9e9f8;font-family:Inter,sans-serif;display:flex
 <div class="msg">{notice}</div></div></body></html>'''
 
 
+@app.route('/owner/notices')
+def owner_notices():
+    if not session.get('is_admin'):
+        flash('Owner access required', 'error')
+        return redirect(url_for('owner_login'))
+    return render_template_string(
+        OWNER_NOTICES_HTML,
+        global_notice=get_global_notice(),
+        login_notice_enabled=is_user_login_notice_enabled(),
+        login_notice_text=get_user_login_notice(),
+        logo_url=get_logo_url(),
+    )
+
+
 @app.route('/owner/set_global_notice', methods=['POST'])
 def owner_set_global_notice():
     if not session.get('is_admin'):
@@ -6755,7 +6752,7 @@ def owner_set_global_notice():
     notice = request.form.get('notice_text', '').strip()
     set_setting('global_notice_text', notice)
     flash('✅ Global notice updated!', 'success')
-    return redirect(url_for('owner_dashboard'))
+    return redirect(url_for('owner_notices'))
 
 
 @app.route('/owner/set_user_login_notice', methods=['POST'])
@@ -6777,7 +6774,7 @@ def owner_set_user_login_notice():
     else:
         set_setting('user_login_notice_text', notice_text)
         flash('✅ Notice text saved!', 'success')
-    return redirect(url_for('owner_dashboard'))
+    return redirect(url_for('owner_notices'))
 
 
 @app.route('/owner/set_user_notice/<int:user_id>', methods=['POST'])
