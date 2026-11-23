@@ -39,3 +39,16 @@ python main.py
 - Modules: `/owner/modules`
 - Photos: `/owner/photos`
 - File Manager: `/owner/files`
+
+## Railway / Gunicorn (important)
+Default gunicorn timeout is **30 seconds**. Large file uploads will hit:
+`CRITICAL WORKER TIMEOUT` → worker killed → `SystemExit: 1`
+
+Use the included `Procfile`:
+```
+web: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300 --graceful-timeout 120 --keep-alive 5
+```
+
+Or set Railway **Start Command** to the same line.
+- `--timeout 300` = 5 minutes for uploads / slow requests
+- `--workers 1` = safer for bot subprocess management
