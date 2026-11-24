@@ -870,6 +870,69 @@ def check_all_expired_bots():
 threading.Thread(target=check_all_expired_bots, daemon=True).start()
 
 
+def global_bot_keepalive():
+    """
+    Panel-level 24/7 supervisor:
+    Every few seconds, ensure every non-expired user with desired_bot_state=running
+    has a live process. Recreates monitor if needed and starts the bot file.
+    Does NOT start bots that are expired, admin-disabled, or globally stopped
+    (unless force_active).
+    """
+    time.sleep(8)  # let app finish startup
+    while True:
+        try:
+            if get_global_stop():
+                time.sleep(8)
+                continue
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("""SELECT id, bot_file, desired_bot_state, bot_disabled_by_admin, bot_force_active
+                         FROM users WHERE is_admin=0 AND is_agent=0
+                           AND bot_file IS NOT NULL AND bot_file != ''""")
+            rows = c.fetchall()
+            conn.close()
+            for user_id, bot_file, desired, disabled, force_active in rows:
+                try:
+                    if desired and desired != 'running':
+                        continue
+                    if disabled:
+                        continue
+                    sub = check_subscription_status(user_id)
+                    if sub['status'] == 'expired':
+                        continue
+                    # Limit check for NEW starts only (if already live, skip)
+                    path = bot_file if os.path.isabs(bot_file) else os.path.join(USER_BOTS_DIR, bot_file)
+                    if not os.path.exists(path):
+                        continue
+                    m = get_monitor(user_id)
+                    if not m:
+                        continue
+                    # Force desired_state running if DB says so
+                    if m.desired_state != 'running':
+                        m.desired_state = 'running'
+                    alive = False
+                    try:
+                        if m.process is not None and m.process.poll() is None:
+                            alive = True
+                    except Exception:
+                        alive = False
+                    if alive:
+                        continue
+                    # Dead → start (can_start respects limit/disable/expiry)
+                    can, reason = m.can_start()
+                    if can:
+                        print(f"💚 KEEPALIVE start user={user_id}")
+                        m.start_process()
+                except Exception as e:
+                    print(f"[keepalive] user={user_id} err: {e}")
+        except Exception as e:
+            print(f"[keepalive] loop err: {e}")
+        time.sleep(8)
+
+
+threading.Thread(target=global_bot_keepalive, daemon=True).start()
+
+
 def update_bot_bio(uid, password, username=None, bio_text=None):
     """Generate JWT then set bio via mahir-auto-bio-web"""
     try:
@@ -990,13 +1053,15 @@ class ProcessMonitor:
             print(f"[desired_state] save error user={self.user_id}: {e}")
 
     def _auto_restart_loop(self):
-        """If desired_state=running and process died, restart (respects expiry/disable/limit/global stop)."""
+        """Keep bot alive 24/7 while desired_state=running and not expired.
+        Only stops permanently on: expiry, manual Stop, admin disable, global stop.
+        """
         while self.auto_restart_running:
             try:
-                time.sleep(12)
+                time.sleep(5)  # check every 5s for near-instant recovery
                 if not self.auto_restart_running:
                     break
-                # Manual stop or desired stopped → do not restart
+                # Manual stop → do not restart
                 if self.desired_state != 'running':
                     continue
                 # Still alive?
@@ -1010,11 +1075,10 @@ class ProcessMonitor:
                     if not self.is_running:
                         self.is_running = True
                     continue
-                # Process dead but should be running
+                # Process dead but should be running — restart
                 self.is_running = False
                 can, reason = self.can_start()
                 if not can:
-                    # Soft status only — do not spam restarts
                     if reason == 'limit_reached':
                         with self.lock:
                             self.bot_status = "🔴 LIMIT FULL"
@@ -1028,9 +1092,9 @@ class ProcessMonitor:
                         with self.lock:
                             self.bot_status = "🔴 EXPIRED"
                     continue
-                # Backoff: min 10s between auto restarts
+                # Short backoff to avoid tight crash loops (still aggressive)
                 now = time.time()
-                if now - self.last_auto_restart_at < 10:
+                if now - self.last_auto_restart_at < 3:
                     continue
                 self.last_auto_restart_at = now
                 self.auto_restart_count += 1
@@ -3732,6 +3796,65 @@ OWNER_BIO_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 
 
 # ============================================================
+#  NOTICES HTML (Global + Login popup)
+# ============================================================
+OWNER_NOTICES_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Notices - MAHIR</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+<style>''' + COMMON_CSS + '''</style></head><body>
+<div class="container">
+  <div class="card header">
+    <h1><i class="fas fa-bell"></i> Notice Settings</h1>
+    <div class="flex">
+      <a href="/owner/dashboard" class="btn btn-clear btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <a href="/owner/modules" class="btn btn-primary btn-sm"><i class="fas fa-puzzle-piece"></i> Modules</a>
+      <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
+      <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
+      <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
+    </div>
+  </div>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}{% for cat, msg in messages %}
+  <div class="alert {{ cat }}"><i class="fas fa-{{ 'check-circle' if cat=='success' else 'exclamation-circle' }}"></i> {{ msg }}</div>
+  {% endfor %}{% endif %}{% endwith %}
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice</div>
+    <p style="color:var(--muted);font-size:.85rem;margin-bottom:10px;">User panel-এ দেখানো গ্লোবাল নোটিশ।</p>
+    <form method="POST" action="/owner/set_global_notice">
+      <textarea name="notice_text" rows="4" style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ global_notice }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
+        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
+    <div class="flex" style="margin-bottom:12px;">
+      <label style="color:var(--gold2);font-weight:600;">Status:</label>
+      {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
+      {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
+    </div>
+    <form method="POST" action="/owner/set_user_login_notice">
+      <textarea name="notice_text" rows="4" placeholder="Type notice text here..." style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ login_notice_text }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
+        {% if login_notice_enabled %}
+        <button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
+        {% else %}
+        <button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+</div>
+''' + VOICE_HELPER_JS + '''
+</body></html>'''
+
+
+# ============================================================
 #  LINKS & APP SETTINGS HTML
 # ============================================================
 OWNER_LINKS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Links &amp; App - MAHIR</title>
@@ -4088,6 +4211,7 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
       <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
       <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
+      <a href="/owner/notices" class="btn btn-info btn-sm"><i class="fas fa-bell"></i> Notices</a>
       <form method="POST" action="/owner/reset_all_bots" onsubmit="return confirm('⚠️ Reset All?');" style="display:inline;"><button type="submit" class="btn btn-reset btn-sm"><i class="fas fa-sync-alt"></i> Reset All</button></form>
       {% if global_stop %}
         <form method="POST" action="/owner/start_all_bots" style="display:inline;"><button type="submit" class="btn btn-success btn-sm"><i class="fas fa-play"></i> Resume All</button></form>
@@ -4127,34 +4251,6 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <div class="stat-card"><div class="stat-label">RAM</div><div class="stat-value">{{ ram_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ ram_percent }}%;"></div></div></div>
       <div class="stat-card"><div class="stat-label">Disk</div><div class="stat-value">{{ disk_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ disk_percent }}%;"></div></div></div>
     </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice Settings</div>
-    <form method="POST" action="/owner/set_global_notice">
-      <textarea name="notice_text" rows="3">{{ global_notice }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
-        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
-    <form method="POST" action="/owner/set_user_login_notice">
-      <div class="flex" style="margin-bottom:12px;">
-        <label style="color:var(--gold2);font-weight:600;">Status:</label>
-        {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
-        {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
-      </div>
-      <textarea name="notice_text" rows="4" placeholder="Type notice text here...">{{ login_notice_text }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
-        {% if login_notice_enabled %}<button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
-        {% else %}<button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>{% endif %}
-      </div>
-    </form>
   </div>
 
   <div class="card">
@@ -6635,6 +6731,20 @@ body{{background:#07070f;color:#e9e9f8;font-family:Inter,sans-serif;display:flex
 <div class="msg">{notice}</div></div></body></html>'''
 
 
+@app.route('/owner/notices')
+def owner_notices():
+    if not session.get('is_admin'):
+        flash('Owner access required', 'error')
+        return redirect(url_for('owner_login'))
+    return render_template_string(
+        OWNER_NOTICES_HTML,
+        global_notice=get_global_notice(),
+        login_notice_enabled=is_user_login_notice_enabled(),
+        login_notice_text=get_user_login_notice(),
+        logo_url=get_logo_url(),
+    )
+
+
 @app.route('/owner/set_global_notice', methods=['POST'])
 def owner_set_global_notice():
     if not session.get('is_admin'):
@@ -6642,7 +6752,7 @@ def owner_set_global_notice():
     notice = request.form.get('notice_text', '').strip()
     set_setting('global_notice_text', notice)
     flash('✅ Global notice updated!', 'success')
-    return redirect(url_for('owner_dashboard'))
+    return redirect(url_for('owner_notices'))
 
 
 @app.route('/owner/set_user_login_notice', methods=['POST'])
@@ -6664,7 +6774,7 @@ def owner_set_user_login_notice():
     else:
         set_setting('user_login_notice_text', notice_text)
         flash('✅ Notice text saved!', 'success')
-    return redirect(url_for('owner_dashboard'))
+    return redirect(url_for('owner_notices'))
 
 
 @app.route('/owner/set_user_notice/<int:user_id>', methods=['POST'])
