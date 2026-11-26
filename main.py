@@ -263,6 +263,8 @@ def migrate_db():
             c.execute('ALTER TABLE users ADD COLUMN personal_notice_enabled INTEGER DEFAULT 0')
         if 'desired_bot_state' not in cols:
             c.execute("ALTER TABLE users ADD COLUMN desired_bot_state TEXT DEFAULT 'running'")
+        if 'voice_enabled' not in cols:
+            c.execute('ALTER TABLE users ADD COLUMN voice_enabled INTEGER DEFAULT 1')
 
         # custom_links: section + sort_order for reorder & group titles
         try:
@@ -1803,6 +1805,14 @@ def rebuild_all_bot_files(delete_expired=True):
                 continue
 
             # -- Non-expired: rebuild fresh --
+            # Stop running bot before overwriting file (prevents file-in-use errors)
+            try:
+                with monitors_lock:
+                    m_old = monitors.get(user_id)
+                if m_old:
+                    m_old.stop_process()
+            except Exception:
+                pass
             shutil.copy2(MAHIR_SOURCE, bot_path)
 
             admin_list = parse_admin_uids(admin_uid)
@@ -1932,7 +1942,7 @@ def reset_all_bots():
     print(f"✅ Reset All complete: rebuilt={result['updated']}, "
           f"expired_deleted={result['deleted_expired']}, "
           f"started={success}, fail={fail}, skipped={skipped}")
-    return success, fail
+    return success, fail, skipped
 
 
 # ============================================================
@@ -3006,23 +3016,125 @@ document.addEventListener('click',function(e){var m=document.querySelector('.ham
 # Browser voice helper — used across panels
 VOICE_HELPER_JS = '''
 <script>
-window.mahirSpeak = function(text, lang){
-  try{
-    if(!window.speechSynthesis || !text) return;
-    window.speechSynthesis.cancel();
-    var u = new SpeechSynthesisUtterance(String(text));
-    u.lang = lang || 'bn-BD';
-    u.rate = 0.95;
-    u.pitch = 1;
+/* ===== MAHIR VOICE SYSTEM with ON/OFF Toggle ===== */
+(function(){
+  /* Voice preference: localStorage per browser */
+  function isVoiceOn(){
+    try{ return localStorage.getItem('mahir_voice_enabled') !== '0'; }catch(e){ return true; }
+  }
+  function setVoiceOn(val){
+    try{ localStorage.setItem('mahir_voice_enabled', val ? '1' : '0'); }catch(e){}
+  }
+
+  /* Core speak function — respects toggle */
+  window.mahirSpeak = function(text, lang){
     try{
-      var voices = window.speechSynthesis.getVoices() || [];
-      var bn = voices.find(function(v){ return (v.lang||'').toLowerCase().indexOf('bn')===0; });
-      if(bn) u.voice = bn;
+      if(!isVoiceOn()) return;
+      if(!window.speechSynthesis || !text) return;
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(String(text));
+      u.lang = lang || 'bn-BD';
+      u.rate = 0.95;
+      u.pitch = 1;
+      try{
+        var voices = window.speechSynthesis.getVoices() || [];
+        var bn = voices.find(function(v){ return (v.lang||'').toLowerCase().indexOf('bn')===0; });
+        if(bn) u.voice = bn;
+      }catch(e){}
+      window.speechSynthesis.speak(u);
     }catch(e){}
-    window.speechSynthesis.speak(u);
-  }catch(e){}
-};
-try{ if(window.speechSynthesis){ window.speechSynthesis.getVoices(); window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();}; } }catch(e){}
+  };
+
+  /* Toggle voice on/off */
+  window.mahirVoiceToggle = function(){
+    var on = !isVoiceOn();
+    setVoiceOn(on);
+    /* Update all toggle buttons on page */
+    document.querySelectorAll('.mahir-voice-btn').forEach(function(btn){
+      _updateVoiceBtn(btn, on);
+    });
+    if(on){ window.mahirSpeak('ভয়েস চালু হয়েছে'); }
+    else { try{ window.speechSynthesis && window.speechSynthesis.cancel(); }catch(e){} }
+    /* Sync with server (best-effort) */
+    try{
+      fetch('/api/voice_toggle',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({voice_enabled:on})
+      }).catch(function(){});
+    }catch(e){}
+  };
+
+  /* Render correct state on a button */
+  function _updateVoiceBtn(btn, on){
+    if(on === undefined) on = isVoiceOn();
+    btn.innerHTML = on
+      ? '<i class="fas fa-volume-up"></i> Voice ON'
+      : '<i class="fas fa-volume-mute"></i> Voice OFF';
+    btn.style.background = on
+      ? 'linear-gradient(135deg,#4ade80,#22c55e)'
+      : 'linear-gradient(135deg,#6b7280,#4b5563)';
+    btn.title = on ? 'Click to turn off voice' : 'Click to turn on voice';
+  }
+
+  /* Inject voice toggle button into navbar/header */
+  function injectVoiceToggleBtn(){
+    /* Avoid duplicate inject */
+    if(document.querySelector('.mahir-voice-btn')) return;
+    var targets = [
+      document.querySelector('.nav-actions'),
+      document.querySelector('.top-bar'),
+      document.querySelector('.navbar'),
+      document.querySelector('header nav'),
+      document.querySelector('nav'),
+    ];
+    var container = null;
+    for(var i=0;i<targets.length;i++){ if(targets[i]){ container=targets[i]; break; } }
+    if(!container){
+      /* Fallback: fixed button bottom-right */
+      container = document.createElement('div');
+      container.style.cssText='position:fixed;bottom:16px;right:16px;z-index:9999;';
+      document.body.appendChild(container);
+    }
+    var btn = document.createElement('button');
+    btn.className = 'mahir-voice-btn';
+    btn.style.cssText='border:none;border-radius:8px;padding:6px 12px;color:#fff;cursor:pointer;font-size:0.82rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;margin:0 4px;box-shadow:0 2px 8px rgba(0,0,0,.3);';
+    _updateVoiceBtn(btn, isVoiceOn());
+    btn.onclick = function(){ window.mahirVoiceToggle(); };
+    container.appendChild(btn);
+  }
+
+  try{ if(window.speechSynthesis){ window.speechSynthesis.getVoices(); window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();}; } }catch(e){}
+
+  /* Sync all static voice buttons on page load */
+  function syncStaticVoiceBtns(){
+    var on = isVoiceOn();
+    document.querySelectorAll('.mahir-voice-btn').forEach(function(btn){
+      if(on){
+        btn.innerHTML='<i class="fas fa-volume-up"></i> Voice ON';
+        btn.style.background='linear-gradient(135deg,#4ade80,#22c55e)';
+        btn.title='Click to turn off voice';
+      } else {
+        btn.innerHTML='<i class="fas fa-volume-mute"></i> Voice OFF';
+        btn.style.background='linear-gradient(135deg,#6b7280,#4b5563)';
+        btn.title='Click to turn on voice';
+      }
+      /* Ensure click handler is attached */
+      if(!btn.__mahirVoiceToggleBound){
+        btn.__mahirVoiceToggleBound = true;
+        btn.onclick = function(){ window.mahirVoiceToggle(); };
+      }
+    });
+  }
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded', function(){
+      syncStaticVoiceBtns();
+    });
+  } else {
+    syncStaticVoiceBtns();
+  }
+})();
 
 /* Auto voice for file uploads + flash messages */
 (function(){
@@ -3180,6 +3292,7 @@ AGENT_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <a href="/agent/subscription" class="btn btn-gold btn-sm"><i class="fas fa-clock-rotate-left"></i> Subscription Management</a>
       <button type="button" class="btn btn-info btn-sm" onclick="openDbDownloadModal()"><i class="fas fa-database"></i> Download DB</button>
       <span class="welcome-text">Welcome, <strong>{{ session.username }}</strong></span>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/agent/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -3475,6 +3588,7 @@ AGENT_SUBSCRIPTION_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset=
     <div class="flex">
       <a href="/agent/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
       <span class="welcome-text">Agent: <strong>{{ session.username }}</strong></span>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/agent/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -3613,6 +3727,7 @@ AGENT_CUSTOMER_HISTORY_HTML = '''<!DOCTYPE html><html lang="en"><head><meta char
     <div class="flex">
       <a href="/agent/subscription" class="btn btn-gold btn-sm"><i class="fas fa-arrow-left"></i> Subscription</a>
       <a href="/agent/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-th-large"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/agent/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4219,6 +4334,7 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
         <form method="POST" action="/owner/stop_all_bots" onsubmit="return confirm('Stop all bots globally?');" style="display:inline;"><button type="submit" class="btn btn-danger btn-sm"><i class="fas fa-hand-paper"></i> Stop All (Lock)</button></form>
       {% endif %}
       <span class="welcome-text">Welcome, <strong>{{ session.username }}</strong></span>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4527,6 +4643,7 @@ OWNER_GROUP_KEYS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="U
     <h1>{% if is_owner %}<i class="fas fa-crown" style="color:#F5C842;"></i> {{ group_name }}{% else %}<i class="fas fa-user-tie" style="color:#7ab5ff;"></i> AGENT {{ group_name }}{% endif %}</h1>
     <div class="flex">
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4607,6 +4724,7 @@ OWNER_KEY_DETAILS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="
     <div class="flex">
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
       <a href="/owner/group_keys/{{ creator_slug }}" class="btn btn-gold btn-sm"><i class="fas fa-layer-group"></i> Back to Group</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4766,6 +4884,7 @@ OWNER_GROUP_USERS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="
     <h1>{% if is_owner %}<i class="fas fa-crown" style="color:#F5C842;"></i> {{ group_name }} — Users{% else %}<i class="fas fa-user-tie" style="color:#7ab5ff;"></i> AGENT {{ group_name }} — Users{% endif %}</h1>
     <div class="flex">
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4820,6 +4939,7 @@ OWNER_GROUP_HISTORY_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset
     <h1>{% if is_owner %}<i class="fas fa-crown" style="color:#F5C842;"></i> {{ group_name }} — History{% else %}<i class="fas fa-user-tie" style="color:#7ab5ff;"></i> AGENT {{ group_name }} — History{% endif %}</h1>
     <div class="flex">
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -4882,6 +5002,7 @@ USER_DETAILS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8
       <a href="/owner/login_as/{{ user.id }}" class="btn btn-gold btn-sm" style="font-weight:700;"><i class="fas fa-sign-in-alt"></i> User Panel Login</a>
       {% endif %}
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -5059,6 +5180,7 @@ FILE_MANAGER_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8
     <h1><i class="fas fa-folder-open"></i> File Manager</h1>
     <div class="flex">
       <a href="/owner/dashboard" class="btn btn-primary btn-sm"><i class="fas fa-th-large"></i> Dashboard</a>
+      <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
       <a href="/owner/logout" class="btn btn-danger btn-sm"><i class="fas fa-sign-out-alt"></i> Logout</a>
     </div>
   </div>
@@ -5282,6 +5404,7 @@ USER_PANEL_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/
   {% if owner_mode %}
   <a href="/owner/return" class="btn btn-gold btn-sm" style="position:absolute;top:16px;right:100px;z-index:50;font-weight:700;"><i class="fas fa-crown"></i> Return to Owner</a>
   {% endif %}
+  <button onclick="if(window.mahirVoiceToggle)window.mahirVoiceToggle();" class="mahir-voice-btn" style="border:none;border-radius:8px;padding:5px 11px;color:#fff;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:linear-gradient(135deg,#4ade80,#22c55e);margin-right:6px;" title="Voice Toggle"><i class="fas fa-volume-up"></i> Voice</button>
   <button class="logout-btn btn btn-danger btn-sm" onclick="window.location.href='/logout'"><i class="fas fa-sign-out-alt"></i> Logout</button>
   
   <div class="cover-section">
@@ -6812,8 +6935,8 @@ def owner_start_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
     set_setting('global_bot_stop', '0')
-    success, fail = reset_all_bots()
-    flash(f'✅ Global stop OFF! Rebuilt + {success} bots started.', 'success')
+    success, fail, skipped = reset_all_bots()
+    flash(f'✅ Global stop OFF! Rebuilt + {success} started, {fail} failed, {skipped} skipped.', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8099,8 +8222,8 @@ def owner_upload_users_db():
 def owner_reset_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
-    success, fail = reset_all_bots()
-    flash(f'🔄 Reset complete: {success} bots started, {fail} failed. All bot files were rebuilt from mahir.py + DB creds, expired files deleted.', 'success')
+    success, fail, skipped = reset_all_bots()
+    flash(f'🔄 Reset complete: {success} started, {fail} failed, {skipped} skipped. Files rebuilt from mahir.py + DB creds, expired deleted.', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8124,6 +8247,38 @@ def api_sidebar_links():
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e), 'apk_url': '#', 'links': []}), 500
+
+
+
+@app.route('/api/voice_toggle', methods=['POST'])
+def api_voice_toggle():
+    """Toggle voice on/off for the current user (stored server-side in DB)."""
+    uid = session.get('user_id') or session.get('agent_id') or (-1 if session.get('is_admin') else None)
+    if uid is None:
+        return jsonify({'error': 'Login required'}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        # Accept explicit value or toggle
+        if 'voice_enabled' in data:
+            new_val = 1 if data['voice_enabled'] else 0
+        else:
+            # Toggle from DB
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('SELECT voice_enabled FROM users WHERE id=?', (uid,))
+            row = c.fetchone()
+            conn.close()
+            current = row[0] if row and row[0] is not None else 1
+            new_val = 0 if current else 1
+        if uid > 0:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('UPDATE users SET voice_enabled=? WHERE id=?', (new_val, uid))
+            conn.commit()
+            conn.close()
+        return jsonify({'status': 'ok', 'voice_enabled': bool(new_val)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/status')
