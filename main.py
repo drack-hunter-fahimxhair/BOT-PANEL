@@ -6,7 +6,6 @@ import sys
 import sqlite3
 import hashlib
 import secrets
-import tempfile
 import json
 import time
 import subprocess
@@ -17,7 +16,7 @@ import signal
 import zipfile
 from datetime import datetime, timedelta
 from queue import Queue, Empty
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash, send_file, send_from_directory, g
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash, send_file, send_from_directory
 from functools import wraps
 import psutil
 import requests
@@ -559,37 +558,6 @@ def get_global_stop():
     return get_setting('global_bot_stop', '0') == '1'
 
 
-def get_max_running_bots():
-    """Max concurrent running bots. -1 = unlimited."""
-    try:
-        return int(get_setting('max_running_bots', '-1'))
-    except Exception:
-        return -1
-
-
-def count_running_bots(exclude_user_id=None):
-    """Count bots that currently have a live process."""
-    n = 0
-    with monitors_lock:
-        for uid, m in list(monitors.items()):
-            if exclude_user_id is not None and uid == exclude_user_id:
-                continue
-            try:
-                if m.is_running and m.process is not None and m.process.poll() is None:
-                    n += 1
-            except Exception:
-                pass
-    return n
-
-
-def is_bot_limit_full():
-    """True when owner-set concurrent limit is reached."""
-    max_b = get_max_running_bots()
-    if max_b < 0:
-        return False
-    return count_running_bots() >= max_b
-
-
 def get_global_notice():
     return get_setting(
         'global_notice_text',
@@ -772,20 +740,6 @@ def format_time_left(expiry_dt):
     return ' '.join(parts) if parts else 'Less than 1m'
 
 
-# --- Multi-worker safety: supervisor threads শুধু একটা worker-এ চলবে ---
-try:
-    import fcntl as _fcntl
-    _leader_fd = open(os.path.join(tempfile.gettempdir(), 'mahir_panel_leader.lock'), 'w')
-    _fcntl.flock(_leader_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-    _IS_LEADER = True
-except Exception as _e:
-    _IS_LEADER = False
-    try:
-        import fcntl as _chk  # fcntl আছে কিন্তু lock পায়নি = অন্য worker leader
-        print("⚠️ এটা non-leader worker। gunicorn-এ -w 1 ব্যবহার করুন (gunicorn.conf.py দেখুন)।")
-    except ImportError:
-        _IS_LEADER = True   # Windows
-
 def expire_user_bot(user_id):
     """
     ✅ Expired হলে:
@@ -882,75 +836,7 @@ def check_all_expired_bots():
         time.sleep(15)
 
 
-if _IS_LEADER:
-    threading.Thread(target=check_all_expired_bots, daemon=True).start()
-
-
-def global_bot_keepalive():
-    """
-    Panel-level 24/7 supervisor:
-    Every few seconds, ensure every non-expired user with desired_bot_state=running
-    has a live process. Recreates monitor if needed and starts the bot file.
-    Does NOT start bots that are expired, admin-disabled, or globally stopped
-    (unless force_active).
-    """
-    time.sleep(8)  # let app finish startup
-    while True:
-        try:
-            if get_global_stop():
-                time.sleep(8)
-                continue
-            if time.time() < _REBUILD_UNTIL:
-                time.sleep(2)
-                continue
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute("""SELECT id, bot_file, desired_bot_state, bot_disabled_by_admin, bot_force_active
-                         FROM users WHERE is_admin=0 AND is_agent=0
-                           AND bot_file IS NOT NULL AND bot_file != ''""")
-            rows = c.fetchall()
-            conn.close()
-            for user_id, bot_file, desired, disabled, force_active in rows:
-                try:
-                    if desired and desired != 'running':
-                        continue
-                    if disabled:
-                        continue
-                    sub = check_subscription_status(user_id)
-                    if sub['status'] == 'expired':
-                        continue
-                    # Limit check for NEW starts only (if already live, skip)
-                    path = bot_file if os.path.isabs(bot_file) else os.path.join(USER_BOTS_DIR, bot_file)
-                    if not os.path.exists(path):
-                        continue
-                    m = get_monitor(user_id)
-                    if not m:
-                        continue
-                    # Force desired_state running if DB says so
-                    if m.desired_state != 'running':
-                        m.desired_state = 'running'
-                    alive = False
-                    try:
-                        if m.process is not None and m.process.poll() is None:
-                            alive = True
-                    except Exception:
-                        alive = False
-                    if alive:
-                        continue
-                    # Dead → start (can_start respects limit/disable/expiry)
-                    can, reason = m.can_start()
-                    if can:
-                        print(f"💚 KEEPALIVE start user={user_id}")
-                        m.start_process()
-                except Exception as e:
-                    print(f"[keepalive] user={user_id} err: {e}")
-        except Exception as e:
-            print(f"[keepalive] loop err: {e}")
-        time.sleep(8)
-
-
-if _IS_LEADER:
-    threading.Thread(target=global_bot_keepalive, daemon=True).start()
+threading.Thread(target=check_all_expired_bots, daemon=True).start()
 
 
 def update_bot_bio(uid, password, username=None, bio_text=None):
@@ -1036,13 +922,9 @@ class ProcessMonitor:
 
         self.desired_state = self._load_desired_state()
         self.last_restart_reason = None
-        self.auto_restart_count = 0
-        self.last_auto_restart_at = 0
 
-        # Auto-restart supervisor (keeps bot up when desired_state=running)
-        self.auto_restart_running = True
-        self.auto_restart_thread = threading.Thread(target=self._auto_restart_loop, daemon=True)
-        self.auto_restart_thread.start()
+        self.auto_restart_running = False
+        self.auto_restart_thread = None
 
         self.watchdog_running = True
         self.watchdog_thread = threading.Thread(target=self._expiry_watchdog, daemon=True)
@@ -1073,56 +955,7 @@ class ProcessMonitor:
             print(f"[desired_state] save error user={self.user_id}: {e}")
 
     def _auto_restart_loop(self):
-        """Keep bot alive 24/7 while desired_state=running and not expired.
-        Only stops permanently on: expiry, manual Stop, admin disable, global stop.
-        """
-        while self.auto_restart_running:
-            try:
-                time.sleep(5)  # check every 5s for near-instant recovery
-                if not self.auto_restart_running:
-                    break
-                # Manual stop → do not restart
-                if self.desired_state != 'running':
-                    continue
-                # Still alive?
-                alive = False
-                try:
-                    if self.process is not None and self.process.poll() is None:
-                        alive = True
-                except Exception:
-                    alive = False
-                if alive:
-                    if not self.is_running:
-                        self.is_running = True
-                    continue
-                # Process dead but should be running — restart
-                self.is_running = False
-                can, reason = self.can_start()
-                if not can:
-                    if reason == 'limit_reached':
-                        with self.lock:
-                            self.bot_status = "🔴 LIMIT FULL"
-                    elif reason == 'global_stop':
-                        with self.lock:
-                            self.bot_status = "🔴 GLOBAL STOP"
-                    elif reason == 'admin_disabled':
-                        with self.lock:
-                            self.bot_status = "🔴 BLOCKED"
-                    elif reason == 'expired':
-                        with self.lock:
-                            self.bot_status = "🔴 EXPIRED"
-                    continue
-                # Short backoff to avoid tight crash loops (still aggressive)
-                now = time.time()
-                if now - self.last_auto_restart_at < 3:
-                    continue
-                self.last_auto_restart_at = now
-                self.auto_restart_count += 1
-                self.last_restart_reason = 'AUTO_RESTART'
-                print(f"🔄 AUTO-RESTART user={self.user_id} count={self.auto_restart_count}")
-                self.start_process()
-            except Exception as e:
-                print(f"[auto_restart] user={self.user_id} error: {e}")
+        return
 
     def _expiry_watchdog(self):
         while self.watchdog_running:
@@ -1151,7 +984,7 @@ class ProcessMonitor:
                             print(f"\n⏰ WATCHDOG: User {self.user_id} EXPIRED → Killing process + deleting file")
                             self.watchdog_running = False
                             self.auto_restart_running = False
-                            self.stop_process(manual=False)
+                            self.stop_process()
                             expire_user_bot(self.user_id)
                             break
                     except: pass
@@ -1171,25 +1004,10 @@ class ProcessMonitor:
             if row and row[0]:
                 return False, "admin_disabled"
             if get_global_stop():
-                # Only force_active bots may start during global stop
-                if not (row and row[1]):
-                    return False, "global_stop"
-        except Exception:
-            pass
-
-        # Concurrent running bots limit (owner-set). -1 = unlimited
-        max_b = get_max_running_bots()
-        if max_b >= 0:
-            already_live = False
-            try:
-                if self.process is not None and self.process.poll() is None:
-                    already_live = True
-            except Exception:
-                already_live = False
-            if not already_live:
-                running = count_running_bots(exclude_user_id=self.user_id)
-                if running >= max_b:
-                    return False, "limit_reached"
+                if row and row[1]:
+                    return True, "force_active"
+                return False, "global_stop"
+        except: pass
         return True, "ok"
 
     def clean_ansi(self, text):
@@ -1372,14 +1190,7 @@ class ProcessMonitor:
         if not can:
             with self.lock:
                 self.is_running = False
-                if reason == 'limit_reached':
-                    self.bot_status = "🔴 LIMIT FULL"
-                elif reason == 'expired':
-                    self.bot_status = "🔴 EXPIRED"
-                elif reason == 'global_stop':
-                    self.bot_status = "🔴 GLOBAL STOP"
-                else:
-                    self.bot_status = "🔴 BLOCKED"
+                self.bot_status = "🔴 BLOCKED"
             print(f"⛔ Cannot start user {self.user_id}: {reason}")
             return False
 
@@ -1392,7 +1203,6 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
-            _kill_stray_instances(self.process_name)
 
             try:
                 env_copy = os.environ.copy()
@@ -1426,10 +1236,9 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
-                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(_proc.stdout.readline, ''):
+                        for line in iter(self.process.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1439,8 +1248,6 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
-                    finally:
-                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1458,29 +1265,6 @@ class ProcessMonitor:
                 self.output_lines.append(f"Error: {str(e)}")
                 self.is_running = False
                 return False
-
-    def _log_exit(self, proc):
-        """Process মরলে exit code + কারণ log-এ দেখায় (আগে silent ছিল)।"""
-        try:
-            try:
-                rc = proc.wait(timeout=5)
-            except Exception:
-                rc = proc.poll()
-            if rc is None or self.desired_state == 'stopped':
-                return
-            hints = {
-                -9: 'SIGKILL — সম্ভবত RAM শেষ (OOM) বা কেউ kill করেছে',
-                -15: 'SIGTERM — panel/অন্য process বন্ধ করেছে',
-                -11: 'Segmentation fault — native library crash',
-                0: 'normal exit (script নিজে শেষ হয়েছে)',
-                1: 'error exit — উপরের log দেখুন',
-            }
-            ram = psutil.virtual_memory().percent
-            msg = f"⚠️ BOT PROCESS EXITED code={rc} → {hints.get(rc, 'unexpected exit')} | server RAM {ram}%"
-            self.output_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-            print(f"user={self.user_id} {msg}")
-        except Exception:
-            pass
 
     def _stop_process_internal(self):
         if self.process:
@@ -1617,7 +1401,6 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
-            _kill_stray_instances(self.process_name)
             try:
                 env_copy = os.environ.copy()
                 env_copy['TERM'] = 'xterm'
@@ -1648,10 +1431,9 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
-                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(_proc.stdout.readline, ''):
+                        for line in iter(self.process.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1661,8 +1443,6 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
-                    finally:
-                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1676,41 +1456,6 @@ class ProcessMonitor:
 #  MONITORS
 # ============================================================
 monitors = {}
-
-
-
-_REBUILD_UNTIL = 0   # rebuild চলাকালীন keepalive যেন আধা-লেখা ফাইল চালু না করে
-START_STAGGER_SEC = float(os.environ.get('BOT_START_STAGGER', '3'))  # প্রতি বট চালুর মাঝে বিরতি
-
-def _kill_stray_instances(script_path, keep_pid=None):
-    """একই bot file-এর পুরনো/orphan/duplicate process kill করে।
-    একই account দুই process-এ login হলে game server আগেরটাকে kick করে,
-    ফলে বট বারবার offline/restart হয়। (start_new_session থাকায় panel restart হলে
-    পুরনো bot process মরে না — সেগুলোই duplicate হয়ে যায়।)"""
-    killed = 0
-    try:
-        target = os.path.basename(script_path)
-        me = os.getpid()
-        for p in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                if p.info['pid'] in (me, keep_pid):
-                    continue
-                cmd = p.info.get('cmdline') or []
-                if len(cmd) < 2 or 'python' not in os.path.basename(cmd[0]).lower():
-                    continue
-                if any(os.path.basename(a) == target for a in cmd[1:4]):
-                    for ch in p.children(recursive=True):
-                        try: ch.kill()
-                        except Exception: pass
-                    p.kill()
-                    killed += 1
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[stray-kill] error: {e}")
-    if killed:
-        print(f"🧹 Killed {killed} duplicate/orphan process(es) of {os.path.basename(script_path)}")
-    return killed
 
 
 def get_monitor(user_id, create_only=True):
@@ -1811,9 +1556,6 @@ def rebuild_all_bot_files(delete_expired=True):
        - সব monitor stop করে দেওয়া হয়
     Return: dict {updated, deleted_expired, failed, total}
     """
-    global _REBUILD_UNTIL
-    _REBUILD_UNTIL = time.time() + 1800   # keepalive এই সময় অপেক্ষা করবে (job শেষে 0 হয়)
-
     # Stop all monitors first
     with monitors_lock:
         for uid, m in list(monitors.items()):
@@ -1892,7 +1634,6 @@ def rebuild_all_bot_files(delete_expired=True):
                 continue
 
             # -- Non-expired: rebuild fresh --
-            _kill_stray_instances(bot_path)
             shutil.copy2(MAHIR_SOURCE, bot_path)
 
             admin_list = parse_admin_uids(admin_uid)
@@ -1943,11 +1684,9 @@ def _start_all_eligible_bots():
     users = c.fetchall()
     conn.close()
 
-    global _REBUILD_UNTIL
     success = 0
     fail = 0
     skipped = 0
-    launched = []
 
     for user_id, bot_file in users:
         if not bot_file:
@@ -1995,75 +1734,20 @@ def _start_all_eligible_bots():
                     continue
 
         try:
+            m = ProcessMonitor(user_id, path)
             with monitors_lock:
-                m = monitors.get(user_id)
-                if m is None:
-                    m = ProcessMonitor(user_id, path)
-                    monitors[user_id] = m
+                monitors[user_id] = m
             m.last_restart_reason = 'REBUILD_RESTART'
             if m.start_process():
-                launched.append((user_id, m))
+                success += 1
             else:
                 fail += 1
-            time.sleep(START_STAGGER_SEC)   # একসাথে সব bot login/RAM spike না হওয়ার জন্য stagger
         except Exception as e:
             print(f"Start error user {user_id}: {e}")
             fail += 1
 
-    # start_process() শুধু 0.3s দেখে True দেয় — তাই একটু অপেক্ষা করে আসলেই বেঁচে আছে কিনা যাচাই
-    if launched:
-        time.sleep(8)
-        for uid_, m_ in launched:
-            try:
-                if m_.process is not None and m_.process.poll() is None:
-                    success += 1
-                else:
-                    fail += 1
-                    print(f"❌ user={uid_} bot started but DIED within 8s (log-এ exit code দেখুন)")
-            except Exception:
-                fail += 1
-    _REBUILD_UNTIL = 0
-    print(f"🚀 Start summary: alive={success}, died/failed={fail}, skipped={skipped}")
+    print(f"🚀 Start summary: success={success}, failed={fail}, skipped={skipped}")
     return success, fail, skipped
-
-
-
-_RESET_JOB = {'running': False, 'status': 'idle', 'started_at': None}
-_reset_job_lock = threading.Lock()
-
-
-def reset_all_bots_async():
-    """Rebuild + staggered start ব্যাকগ্রাউন্ডে চালায়; web request সাথে সাথে ফেরত আসে
-    (আগে request-এর ভিতরেই সব হতো → gunicorn timeout → server বন্ধ/লোড)।"""
-    with _reset_job_lock:
-        if _RESET_JOB['running']:
-            return False
-        _RESET_JOB.update(running=True, status='rebuilding', started_at=datetime.now().isoformat(timespec='seconds'))
-
-    def _run():
-        global _REBUILD_UNTIL
-        try:
-            r = rebuild_all_bot_files(delete_expired=True)
-            _RESET_JOB['status'] = f"starting bots (rebuilt={r['updated']}, expired_deleted={r['deleted_expired']})"
-            sc, fl, sk = _start_all_eligible_bots()
-            _RESET_JOB['status'] = (f"done: rebuilt={r['updated']}, expired_deleted={r['deleted_expired']}, "
-                                    f"alive={sc}, died/failed={fl}, skipped={sk}")
-        except Exception as e:
-            _RESET_JOB['status'] = f"error: {e}"
-            print(f"[reset job] error: {e}")
-        finally:
-            _REBUILD_UNTIL = 0
-            _RESET_JOB['running'] = False
-
-    threading.Thread(target=_run, daemon=True, name='reset-all-bots').start()
-    return True
-
-
-@app.route('/api/owner/reset_status')
-def api_owner_reset_status():
-    if not session.get('is_admin'):
-        return jsonify({'error': 'Owner only'}), 403
-    return jsonify(_RESET_JOB)
 
 
 def reset_all_bots():
@@ -3150,167 +2834,6 @@ document.addEventListener('click',function(e){var m=document.querySelector('.ham
 </script>
 '''
 
-# Browser voice helper — used across panels
-VOICE_HELPER_JS = '''
-<script>
-window.mahirSpeak = function(text, lang){
-  try{
-    if(!window.speechSynthesis || !text) return;
-    window.speechSynthesis.cancel();
-    var u = new SpeechSynthesisUtterance(String(text));
-    u.lang = lang || 'bn-BD';
-    u.rate = 0.95;
-    u.pitch = 1;
-    try{
-      var voices = window.speechSynthesis.getVoices() || [];
-      var bn = voices.find(function(v){ return (v.lang||'').toLowerCase().indexOf('bn')===0; });
-      if(bn) u.voice = bn;
-    }catch(e){}
-    window.speechSynthesis.speak(u);
-  }catch(e){}
-};
-try{ if(window.speechSynthesis){ window.speechSynthesis.getVoices(); window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();}; } }catch(e){}
-
-/* ===== Voice ON/OFF (account-এ সেভ থাকে) + Verify this device ===== */
-(function(){
-  function getCookie(n){ var m = document.cookie.match(new RegExp('(?:^|; )' + n + '=([^;]*)')); return m ? decodeURIComponent(m[1]) : null; }
-  function setCookie(n, v){ document.cookie = n + '=' + encodeURIComponent(v) + '; path=/; max-age=63072000; samesite=lax'; }
-  function isOn(){
-    var c = getCookie('mahir_voice');
-    if(c !== null) return c !== '0';
-    try{ return localStorage.getItem('mahir_voice_enabled') !== '0'; }catch(e){ return true; }
-  }
-  function setOn(v){
-    setCookie('mahir_voice', v ? '1' : '0');
-    try{ localStorage.setItem('mahir_voice_enabled', v ? '1' : '0'); }catch(e){}
-    try{ fetch('/api/voice_pref', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: v})}); }catch(e){}
-  }
-  try{
-    var P = window.SpeechSynthesis && window.SpeechSynthesis.prototype;
-    if(P && !P.__mahirPatched){
-      var orig = P.speak;
-      P.speak = function(u){ if(!isOn()) return; return orig.call(this, u); };
-      P.__mahirPatched = true;
-    }
-  }catch(e){}
-  window.mahirVoiceEnabled = isOn;
-  var BTN = 'position:fixed;left:12px;z-index:99999;padding:8px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.25);background:rgba(20,20,28,.92);color:#fff;font:600 13px system-ui,sans-serif;cursor:pointer;text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.4);';
-  function paintV(b){ var on = isOn(); b.innerHTML = on ? '🔊 Voice ON' : '🔇 Voice OFF'; b.style.opacity = on ? '1' : '0.75'; }
-  function mountVoice(){
-    if(document.getElementById('mahirVoiceToggle')) return;
-    var b = document.createElement('button');
-    b.id = 'mahirVoiceToggle'; b.type = 'button'; b.style.cssText = BTN + 'bottom:12px;';
-    paintV(b);
-    b.addEventListener('click', function(){
-      var next = !isOn();
-      if(!next){ try{ window.speechSynthesis.cancel(); }catch(e){} }
-      setOn(next); paintV(b);
-      if(next && window.mahirSpeak) window.mahirSpeak('ভয়েস চালু হয়েছে');
-    });
-    document.body.appendChild(b);
-  }
-  function paintT(b, t){ b.innerHTML = t ? '✅ Device verified' : '🔐 Verify this device'; b.title = t ? 'চাপলে এই device-এর auto login বন্ধ হবে' : 'Verify করলে পরের বার password ছাড়াই auto login হবে'; }
-  function mountTrust(){
-    fetch('/api/device/status').then(function(r){ if(!r.ok) throw 0; return r.json(); }).then(function(d){
-      var b = document.createElement('button');
-      b.type = 'button'; b.style.cssText = BTN + 'bottom:56px;';
-      paintT(b, d.trusted);
-      b.addEventListener('click', function(){
-        var want = !d.trusted;
-        fetch(want ? '/api/device/trust' : '/api/device/untrust', {method:'POST'}).then(function(r){ return r.json(); }).then(function(x){
-          d.trusted = !!x.trusted; paintT(b, d.trusted);
-          if(window.mahirSpeak) window.mahirSpeak(d.trusted ? 'ডিভাইস ভেরিফাই হয়েছে' : 'ডিভাইস ভেরিফিকেশন বন্ধ হয়েছে');
-        });
-      });
-      document.body.appendChild(b);
-    }).catch(function(){});
-  }
-  function mountLink(){
-    var p = location.pathname || '';
-    var href = p.indexOf('/owner') === 0 ? '/owner/devices' : (p.indexOf('/agent') === 0 ? '/agent/devices' : '');
-    if(!href || p.indexOf('/devices') >= 0) return;
-    var a = document.createElement('a'); a.href = href; a.textContent = '🛡 Devices';
-    a.style.cssText = BTN + 'bottom:100px;';
-    document.body.appendChild(a);
-    try{ fetch('/api/devices/pending').then(function(r){return r.json();}).then(function(d){ if(d && d.count > 0) a.textContent = '🛡 Devices (' + d.count + ' pending)'; }); }catch(e){}
-  }
-  function mountAll(){ mountVoice(); mountTrust(); mountLink(); }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountAll); else mountAll();
-})();
-
-/* Auto voice for file uploads + flash messages */
-(function(){
-  function msgForUploadForm(form){
-    try{
-      var action = (form.getAttribute('action')||'').toLowerCase();
-      var id = (form.id||'').toLowerCase();
-      if(action.indexOf('upload_photo')>=0 || id.indexOf('photo')>=0) return 'ছবি আপলোড শুরু হয়েছে';
-      if(action.indexOf('upload_mahir')>=0 || id.indexOf('mahir')>=0) return 'মাহির ফাইল আপলোড শুরু হয়েছে';
-      if(action.indexOf('upload_users_db')>=0 || action.indexOf('upload')>=0 && id.indexOf('db')>=0) return 'ডাটাবেস আপলোড শুরু হয়েছে';
-      if(action.indexOf('recreate')>=0) return 'বট ফাইল রিক্রিয়েট শুরু হয়েছে';
-      if(action.indexOf('upload_file')>=0 || id.indexOf('upload')>=0) return 'ফাইল আপলোড শুরু হয়েছে';
-      if((form.getAttribute('enctype')||'').toLowerCase().indexOf('multipart')>=0) return 'ফাইল আপলোড শুরু হয়েছে';
-    }catch(e){}
-    return 'ফাইল আপলোড শুরু হয়েছে';
-  }
-  function bindUploadForms(){
-    try{
-      var forms = document.querySelectorAll('form');
-      for(var i=0;i<forms.length;i++){
-        (function(form){
-          var enc = (form.getAttribute('enctype')||'').toLowerCase();
-          var act = (form.getAttribute('action')||'').toLowerCase();
-          var isUpload = enc.indexOf('multipart')>=0 || act.indexOf('upload')>=0 || act.indexOf('recreate')>=0;
-          if(!isUpload) return;
-          if(form.__mahirVoiceBound) return;
-          form.__mahirVoiceBound = true;
-          form.addEventListener('submit', function(){
-            if(window.mahirSpeak) window.mahirSpeak(msgForUploadForm(form));
-          });
-        })(forms[i]);
-      }
-    }catch(e){}
-  }
-  function speakFlashMessages(){
-    try{
-      var alerts = document.querySelectorAll('.alert');
-      if(!alerts || !alerts.length) return;
-      var texts = [];
-      for(var i=0;i<alerts.length;i++){
-        var t = (alerts[i].textContent||'').replace(/\\s+/g,' ').trim();
-        if(!t) continue;
-        var low = t.toLowerCase();
-        var isErr = (alerts[i].className||'').indexOf('error')>=0 || low.indexOf('❌')>=0 || low.indexOf('failed')>=0 || low.indexOf('error')>=0;
-        if(low.indexOf('upload')>=0 || low.indexOf('photo')>=0 || low.indexOf('db ')>=0 || low.indexOf('mahir')>=0 || low.indexOf('file')>=0 || low.indexOf('recreate')>=0 || low.indexOf('আপলোড')>=0){
-          if(isErr) texts.push('আপলোড ব্যর্থ হয়েছে');
-          else texts.push('ফাইল আপলোড সফল হয়েছে');
-        } else if(low.indexOf('key')>=0 && (low.indexOf('generat')>=0 || low.indexOf('created')>=0 || low.indexOf('নতুন')>=0)){
-          texts.push('নতুন কী তৈরি হয়েছে');
-        } else if(isErr){
-          texts.push('সমস্যা হয়েছে');
-        } else if((alerts[i].className||'').indexOf('success')>=0){
-          texts.push('সফল হয়েছে');
-        }
-      }
-      if(texts.length && window.mahirSpeak){
-        // Speak first relevant message only
-        setTimeout(function(){ window.mahirSpeak(texts[0]); }, 450);
-      }
-    }catch(e){}
-  }
-  function init(){
-    bindUploadForms();
-    speakFlashMessages();
-  }
-  if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
-})();
-</script>
-'''
-
 
 # ============================================================
 #  LOGIN PAGES
@@ -3404,33 +2927,12 @@ AGENT_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <div class="stat-card"><div class="stat-label">Keys Created</div><div class="stat-value">{{ key_count }}</div></div>
       <div class="stat-card"><div class="stat-label">My Customers</div><div class="stat-value">{{ my_users|length }}</div></div>
       <div class="stat-card"><div class="stat-label">Key Limit</div><div class="stat-value">{% if key_limit >= 0 %}{{ key_limit }}{% else %}∞{% endif %}</div></div>
-      <div class="stat-card"><div class="stat-label">Server Bots</div><div class="stat-value">{% if max_running_bots >= 0 %}{{ running_bots_count }} / {{ max_running_bots }}{% else %}{{ running_bots_count }} / ∞{% endif %}</div></div>
     </div>
   </div>
-
-  {% if bot_limit_full %}
-  <div class="card" style="background:rgba(212,42,58,.12);border-color:rgba(212,42,58,.45);">
-    <div style="display:flex;align-items:flex-start;gap:14px;color:var(--red2);">
-      <i class="fas fa-exclamation-triangle" style="font-size:1.6rem;margin-top:2px;"></i>
-      <div>
-        <div style="font-weight:800;font-size:1.05rem;margin-bottom:6px;">বট লিমিট পূর্ণ হয়ে গিয়েছে</div>
-        <div style="font-size:.9rem;line-height:1.55;color:#ffb4bc;">
-          সার্ভারে একসাথে চলমান বটের লিমিট পূর্ণ ({{ running_bots_count }} / {{ max_running_bots }})।
-          এখন নতুন বট চালু হবে না এবং <strong>নতুন Registration Key তৈরি করা যাবে না</strong>।
-          Owner লিমিট বাড়ালে বা কোনো বট বন্ধ হলে আবার Key তৈরি করতে পারবেন।
-        </div>
-      </div>
-    </div>
-  </div>
-  {% endif %}
 
   <div class="card">
     <div class="card-title"><i class="fas fa-key"></i> Generate Registration Key</div>
-    {% if bot_limit_full %}
-    <div style="padding:14px;background:rgba(212,42,58,.1);border-radius:12px;color:var(--red2);">
-      <i class="fas fa-ban"></i> বট লিমিট পূর্ণ — নতুন Key তৈরি বন্ধ আছে ({{ running_bots_count }}/{{ max_running_bots }})।
-    </div>
-    {% elif key_limit >= 0 and key_count >= key_limit %}
+    {% if key_limit >= 0 and key_count >= key_limit %}
     <div style="padding:14px;background:rgba(212,42,58,.1);border-radius:12px;color:var(--red2);"><i class="fas fa-exclamation-triangle"></i> Max {{ key_limit }} keys.</div>
     {% else %}
     <form method="POST" action="/agent/create_key" class="input-group">
@@ -3598,9 +3100,7 @@ document.getElementById('dbDownloadModal').addEventListener('click', function(e)
 document.getElementById('dbDownloadForm').addEventListener('submit', function(){
   var b=document.getElementById('dbDownloadBtn'); b.disabled=true; b.innerHTML='<span class="spinner"></span> Downloading...';
 });
-</script>
-''' + VOICE_HELPER_JS + '''
-<script>
+
 /* ═══════════ NEW KEY ANIMATED MODAL JS ═══════════ */
 (function () {
     window.showKeyModal = function (key, durationText, isPermanent) {
@@ -3627,7 +3127,6 @@ document.getElementById('dbDownloadForm').addEventListener('submit', function(){
         modal.classList.add('show');
         var box = modal.querySelector('.key-modal-box');
         if (box) { box.style.animation = 'none'; void box.offsetWidth; box.style.animation = ''; }
-        if (window.mahirSpeak) window.mahirSpeak('নতুন কী তৈরি হয়েছে');
     };
     window.closeKeyModal = function () {
         var modal = document.getElementById('newKeyModal');
@@ -3640,7 +3139,6 @@ document.getElementById('dbDownloadForm').addEventListener('submit', function(){
         function markCopied() {
             el.classList.add('copied');
             el.textContent = '✅ COPIED TO CLIPBOARD';
-            if (window.mahirSpeak) window.mahirSpeak('কী কপি হয়েছে');
             setTimeout(function () { el.classList.remove('copied'); el.textContent = original; }, 1600);
         }
         function fallback() {
@@ -4010,65 +3508,6 @@ OWNER_BIO_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 
 
 # ============================================================
-#  NOTICES HTML (Global + Login popup)
-# ============================================================
-OWNER_NOTICES_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Notices - MAHIR</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
-<style>''' + COMMON_CSS + '''</style></head><body>
-<div class="container">
-  <div class="card header">
-    <h1><i class="fas fa-bell"></i> Notice Settings</h1>
-    <div class="flex">
-      <a href="/owner/dashboard" class="btn btn-clear btn-sm"><i class="fas fa-arrow-left"></i> Dashboard</a>
-      <a href="/owner/modules" class="btn btn-primary btn-sm"><i class="fas fa-puzzle-piece"></i> Modules</a>
-      <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
-      <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
-      <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
-    </div>
-  </div>
-  {% with messages = get_flashed_messages(with_categories=true) %}
-  {% if messages %}{% for cat, msg in messages %}
-  <div class="alert {{ cat }}"><i class="fas fa-{{ 'check-circle' if cat=='success' else 'exclamation-circle' }}"></i> {{ msg }}</div>
-  {% endfor %}{% endif %}{% endwith %}
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice</div>
-    <p style="color:var(--muted);font-size:.85rem;margin-bottom:10px;">User panel-এ দেখানো গ্লোবাল নোটিশ।</p>
-    <form method="POST" action="/owner/set_global_notice">
-      <textarea name="notice_text" rows="4" style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ global_notice }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
-        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
-    <div class="flex" style="margin-bottom:12px;">
-      <label style="color:var(--gold2);font-weight:600;">Status:</label>
-      {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
-      {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
-    </div>
-    <form method="POST" action="/owner/set_user_login_notice">
-      <textarea name="notice_text" rows="4" placeholder="Type notice text here..." style="width:100%;padding:12px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);">{{ login_notice_text }}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
-        {% if login_notice_enabled %}
-        <button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
-        {% else %}
-        <button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>
-        {% endif %}
-      </div>
-    </form>
-  </div>
-</div>
-''' + VOICE_HELPER_JS + '''
-</body></html>'''
-
-
-# ============================================================
 #  LINKS & APP SETTINGS HTML
 # ============================================================
 OWNER_LINKS_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Links &amp; App - MAHIR</title>
@@ -4293,7 +3732,6 @@ PHOTO_MANAGER_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
     {% endif %}
   </div>
 </div>
-''' + VOICE_HELPER_JS + '''
 </body></html>'''
 
 
@@ -4425,7 +3863,6 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
       <a href="/owner/photos" class="btn btn-info btn-sm"><i class="fas fa-images"></i> Photos</a>
       <a href="/owner/bio" class="btn btn-warning btn-sm"><i class="fas fa-pen"></i> Auto Bio</a>
       <a href="/owner/links" class="btn btn-success btn-sm"><i class="fas fa-link"></i> Links &amp; App</a>
-      <a href="/owner/notices" class="btn btn-info btn-sm"><i class="fas fa-bell"></i> Notices</a>
       <form method="POST" action="/owner/reset_all_bots" onsubmit="return confirm('⚠️ Reset All?');" style="display:inline;"><button type="submit" class="btn btn-reset btn-sm"><i class="fas fa-sync-alt"></i> Reset All</button></form>
       {% if global_stop %}
         <form method="POST" action="/owner/start_all_bots" style="display:inline;"><button type="submit" class="btn btn-success btn-sm"><i class="fas fa-play"></i> Resume All</button></form>
@@ -4444,27 +3881,40 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
   {% endif %}
 
   <div class="card">
-    <div class="card-title"><i class="fas fa-tachometer-alt"></i> Concurrent Bot Limit</div>
-    <p style="color:var(--muted);font-size:.85rem;margin-bottom:12px;">
-      একসাথে কতগুলো বট চলতে পারবে সেট করুন। লিমিট পূর্ণ হলে নতুন বট স্টার্ট হবে না (অটো-রিস্টার্টও না)।
-      <strong>-1 = Unlimited</strong>
-    </p>
-    <form method="POST" action="/owner/set_max_bots" class="input-group">
-      <input type="number" name="max_running_bots" value="{{ max_running_bots }}" min="-1" max="5000" style="width:140px;" required/>
-      <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Limit</button>
-      <span class="stat-box">Running now: <strong>{{ running_bots_count }}</strong>
-        {% if max_running_bots >= 0 %} / {{ max_running_bots }}{% else %} / ∞{% endif %}
-      </span>
-    </form>
-  </div>
-
-  <div class="card">
     <div class="card-title"><i class="fas fa-server"></i> Server Resources</div>
     <div class="system-stats">
       <div class="stat-card"><div class="stat-label">CPU</div><div class="stat-value">{{ cpu }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ cpu }}%;"></div></div></div>
       <div class="stat-card"><div class="stat-label">RAM</div><div class="stat-value">{{ ram_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ ram_percent }}%;"></div></div></div>
       <div class="stat-card"><div class="stat-label">Disk</div><div class="stat-value">{{ disk_percent }}%</div><div class="progress-bar"><div class="progress-fill" style="width:{{ disk_percent }}%;"></div></div></div>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bullhorn"></i> Global Notice Settings</div>
+    <form method="POST" action="/owner/set_global_notice">
+      <textarea name="notice_text" rows="3">{{ global_notice }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save Notice</button>
+        <a href="/owner/preview_global_notice" target="_blank" class="btn btn-info btn-sm"><i class="fas fa-eye"></i> Preview</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><i class="fas fa-bell"></i> User Login Notice (Popup)</div>
+    <form method="POST" action="/owner/set_user_login_notice">
+      <div class="flex" style="margin-bottom:12px;">
+        <label style="color:var(--gold2);font-weight:600;">Status:</label>
+        {% if login_notice_enabled %}<span class="badge badge-running">🟢 ENABLED</span>
+        {% else %}<span class="badge badge-stopped">🔴 DISABLED</span>{% endif %}
+      </div>
+      <textarea name="notice_text" rows="4" placeholder="Type notice text here...">{{ login_notice_text }}</textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" name="action" value="save" class="btn btn-gold btn-sm"><i class="fas fa-save"></i> Save</button>
+        {% if login_notice_enabled %}<button type="submit" name="action" value="disable" class="btn btn-danger btn-sm"><i class="fas fa-toggle-off"></i> Disable Notice</button>
+        {% else %}<button type="submit" name="action" value="enable" class="btn btn-success btn-sm"><i class="fas fa-toggle-on"></i> Enable Notice</button>{% endif %}
+      </div>
+    </form>
   </div>
 
   <div class="card">
@@ -4610,9 +4060,9 @@ OWNER_DASHBOARD_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
 </div>
 
 <script>
-document.getElementById('uploadMahirForm').addEventListener('submit',function(e){var f=document.getElementById('mahirFileInput').files[0];if(f && f.name.toLowerCase()!=='mahir.py'){e.preventDefault();alert('❌ Only "mahir.py"!');return false;}var b=document.getElementById('uploadMahirBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Rebuilding...';if(window.mahirSpeak)window.mahirSpeak('মাহির ফাইল আপলোড শুরু');});
-document.getElementById('uploadDbForm').addEventListener('submit',function(){var b=document.getElementById('uploadDbBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Processing...';if(window.mahirSpeak)window.mahirSpeak('ডাটাবেস আপলোড শুরু');});
-document.getElementById('createAgentForm').addEventListener('submit',function(){var b=document.getElementById('createAgentBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Creating...';if(window.mahirSpeak)window.mahirSpeak('এজেন্ট তৈরি হচ্ছে');});
+document.getElementById('uploadMahirForm').addEventListener('submit',function(e){var f=document.getElementById('mahirFileInput').files[0];if(f && f.name.toLowerCase()!=='mahir.py'){e.preventDefault();alert('❌ Only "mahir.py"!');return false;}var b=document.getElementById('uploadMahirBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Rebuilding...';});
+document.getElementById('uploadDbForm').addEventListener('submit',function(){var b=document.getElementById('uploadDbBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Processing...';});
+document.getElementById('createAgentForm').addEventListener('submit',function(){var b=document.getElementById('createAgentBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Creating...';});
 
 /* ═══════════ NEW KEY ANIMATED MODAL JS ═══════════ */
 (function () {
@@ -4640,7 +4090,6 @@ document.getElementById('createAgentForm').addEventListener('submit',function(){
         modal.classList.add('show');
         var box = modal.querySelector('.key-modal-box');
         if (box) { box.style.animation = 'none'; void box.offsetWidth; box.style.animation = ''; }
-        if (window.mahirSpeak) window.mahirSpeak('নতুন কী তৈরি হয়েছে');
     };
     window.closeKeyModal = function () {
         var modal = document.getElementById('newKeyModal');
@@ -4653,7 +4102,6 @@ document.getElementById('createAgentForm').addEventListener('submit',function(){
         function markCopied() {
             el.classList.add('copied');
             el.textContent = '✅ COPIED TO CLIPBOARD';
-            if (window.mahirSpeak) window.mahirSpeak('কী কপি হয়েছে');
             setTimeout(function () { el.classList.remove('copied'); el.textContent = original; }, 1600);
         }
         function fallback() {
@@ -4689,7 +4137,6 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 </script>
 {% endif %}
-''' + VOICE_HELPER_JS + '''
 <script>
 // Voice greeting + soft click sounds
 (function(){
@@ -4704,7 +4151,7 @@ document.addEventListener('DOMContentLoaded', function () {
       window.speechSynthesis.speak(u);
     }catch(e){}
   }
-  function playBeep(){if(window.mahirVoiceEnabled&&!window.mahirVoiceEnabled())return;
+  function playBeep(){
     try{
       var ctx = new (window.AudioContext||window.webkitAudioContext)();
       var o = ctx.createOscillator();
@@ -5321,17 +4768,15 @@ FILE_MANAGER_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8
   </div>
 </div>
 <script>
-document.getElementById('uploadForm').addEventListener('submit',function(){var b=document.getElementById('uploadBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Uploading...';if(window.mahirSpeak)window.mahirSpeak('ফাইল আপলোড শুরু হয়েছে');});
+document.getElementById('uploadForm').addEventListener('submit',function(){var b=document.getElementById('uploadBtn');b.disabled=true;b.innerHTML='<span class="spinner"></span> Uploading...';});
 var currentEditPath='';
 function editFile(path){currentEditPath=path;document.getElementById('editFileName').textContent=path;document.getElementById('editContent').value='Loading...';document.getElementById('editStatus').textContent='';document.getElementById('editModal').classList.add('active');fetch('/owner/edit_file/'+encodeURIComponent(path)).then(function(r){return r.json();}).then(function(data){document.getElementById('editContent').value=data.error?('Error: '+data.error):data.content;});}
 function closeEditModal(){document.getElementById('editModal').classList.remove('active');var box=document.getElementById('editModalBox');if(box)box.classList.remove('fullscreen');var fs=document.getElementById('fsBtn');if(fs)fs.innerHTML='<i class="fas fa-expand"></i>';}
 function toggleFullscreen(){var box=document.getElementById('editModalBox');var btn=document.getElementById('fsBtn');box.classList.toggle('fullscreen');btn.innerHTML=box.classList.contains('fullscreen')?'<i class="fas fa-compress"></i>':'<i class="fas fa-expand"></i>';}
-function saveEdit(){var c=document.getElementById('editContent').value;var s=document.getElementById('editStatus');s.textContent='Saving...';if(window.mahirSpeak)window.mahirSpeak('ফাইল সেভ হচ্ছে');fetch('/owner/edit_file/'+encodeURIComponent(currentEditPath),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:c})}).then(function(r){return r.json();}).then(function(data){if(data.success){s.textContent='Saved!';s.style.color='#4ade80';if(window.mahirSpeak)window.mahirSpeak('ফাইল সেভ হয়েছে');setTimeout(function(){location.reload();},800);}else{s.textContent='Error: '+(data.error||'');s.style.color='#ff5a76';if(window.mahirSpeak)window.mahirSpeak('সেভ ব্যর্থ হয়েছে');}});}
-function deleteFile(path,btn){if(!confirm('Delete?'))return;if(btn)btn.disabled=true;if(window.mahirSpeak)window.mahirSpeak('ফাইল ডিলিট হচ্ছে');fetch('/owner/delete_file/'+encodeURIComponent(path),{method:'POST'}).then(function(r){return r.json();}).then(function(data){if(data.success){if(window.mahirSpeak)window.mahirSpeak('ফাইল ডিলিট হয়েছে');location.reload();}else{alert('Error');if(window.mahirSpeak)window.mahirSpeak('ডিলিট ব্যর্থ হয়েছে');if(btn)btn.disabled=false;}});}
+function saveEdit(){var c=document.getElementById('editContent').value;var s=document.getElementById('editStatus');s.textContent='Saving...';fetch('/owner/edit_file/'+encodeURIComponent(currentEditPath),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:c})}).then(function(r){return r.json();}).then(function(data){if(data.success){s.textContent='Saved!';s.style.color='#4ade80';setTimeout(function(){location.reload();},800);}else{s.textContent='Error: '+(data.error||'');s.style.color='#ff5a76';}});}
+function deleteFile(path,btn){if(!confirm('Delete?'))return;if(btn)btn.disabled=true;fetch('/owner/delete_file/'+encodeURIComponent(path),{method:'POST'}).then(function(r){return r.json();}).then(function(data){if(data.success){location.reload();}else{alert('Error');if(btn)btn.disabled=false;}});}
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){var box=document.getElementById('editModalBox');if(box && box.classList.contains('fullscreen')){toggleFullscreen();return;}closeEditModal();}});
-</script>
-''' + VOICE_HELPER_JS + '''
-</body></html>'''
+</script></body></html>'''
 
 
 # ============================================================
@@ -5789,7 +5234,7 @@ USER_PANEL_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/
     <button class="modal-close" onclick="closeRecreateModal()">&times;</button>
     <div class="modal-title"><i class="fas fa-magic" style="color:var(--purple);"></i> Recreate Bot Account</div>
     <p style="color:var(--muted);font-size:.82rem;margin-bottom:15px;">নতুন FF account create → bio → guild request → bot file + DB update → restart</p>
-    <form method="POST" action="/user/recreate_bot" onsubmit="var ok=confirm('নতুন account create হবে এবং bot restart হবে। Continue?'); if(ok){ if(window.mahirSpeak)window.mahirSpeak('বট ফাইল রিক্রিয়েট শুরু হয়েছে'); this.querySelector('button').disabled=true; document.getElementById('recreate-overlay').style.display='block'; } return ok;">
+    <form method="POST" action="/user/recreate_bot" onsubmit="return confirm('নতুন account create হবে এবং bot restart হবে। Continue?') && (this.querySelector('button').disabled=true, document.getElementById('recreate-overlay').style.display='block', true);">
       <div style="margin-bottom:12px;">
         <label style="color:var(--gold2);font-weight:600;display:block;margin-bottom:6px;font-size:.85rem;">Bot Name Prefix</label>
         <input type="text" name="bot_name" value="MAHIR_TCP" placeholder="MAHIR_TCP" style="width:100%;padding:10px;border-radius:8px;background:#0a0a0f;color:#fff;border:1px solid rgba(245,200,66,.3);"/>
@@ -5869,7 +5314,6 @@ USER_PANEL_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/
   </div>
 </div>
 
-''' + VOICE_HELPER_JS + '''
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 var GLOBAL_NOTICE = {{ notice_json|safe }};
@@ -5912,7 +5356,6 @@ document.addEventListener('DOMContentLoaded', function(){
 function getBtn(id){return document.getElementById(id);}
 function setLoading(btn,loading){if(!btn)return;if(loading){btn._origHtml=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="spinner"></span>';}else{btn.disabled=false;btn.innerHTML=btn._origHtml||btn.innerHTML;}}
 function showNotification(message,type){var el=document.createElement('div');el.className='notification notification-'+type;var icon=type==='success'?'check-circle':(type==='error'?'exclamation-circle':'info-circle');el.innerHTML='<i class="fas fa-'+icon+'"></i> '+message;document.body.appendChild(el);setTimeout(function(){el.remove();},3000);}
-/* voice already handled in specific actions; keep notification silent to avoid double-speak */
 function escapeHtml(text){if(!text)return '';var d=document.createElement('div');d.textContent=text;return d.innerHTML;}
 var performanceChart=null;
 function initChart(){var ctx=document.getElementById('performanceChart');if(!ctx)return;performanceChart=new Chart(ctx.getContext('2d'),{type:'line',data:{labels:Array(20).fill(''),datasets:[{label:'CPU %',data:Array(20).fill(0),borderColor:'#F5C842',tension:.4,fill:true,borderWidth:2,pointRadius:0},{label:'RAM %',data:Array(20).fill(0),borderColor:'#8540F5',tension:.4,fill:true,borderWidth:2,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{labels:{color:'#c5c5e5'}}},scales:{y:{beginAtZero:true,max:100,grid:{color:'rgba(245,200,66,.05)'},ticks:{color:'#a78bfa'}},x:{grid:{color:'rgba(245,200,66,.05)'},ticks:{color:'#a78bfa'}}}}});}
@@ -5950,7 +5393,7 @@ function exportMessages(){fetch('/api/export_messages').then(function(r){return 
 
 function sendAction(action){
   var btnMap={start:'btnStart',stop:'btnStop',reset:'btnReset'};var btn=getBtn(btnMap[action]);var origHtml=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="spinner"></span>';
-  fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})}).then(function(r){return r.json();}).then(function(d){btn.disabled=false;btn.innerHTML=origHtml;if(d.error){showNotification(d.error,'error');if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');}else{showNotification(action.toUpperCase()+' done!','success');setTimeout(updateUI,500);if(window.mahirSpeak){if(action==='start')window.mahirSpeak('বট চালু হয়েছে');else if(action==='stop')window.mahirSpeak('বট বন্ধ হয়েছে');else if(action==='reset')window.mahirSpeak('বট রিসেট হয়েছে');else window.mahirSpeak('কাজ সম্পন্ন');}}}).catch(function(){btn.disabled=false;btn.innerHTML=origHtml;showNotification('Failed','error');if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');});
+  fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})}).then(function(r){return r.json();}).then(function(d){btn.disabled=false;btn.innerHTML=origHtml;if(d.error){showNotification(d.error,'error');}else{showNotification(action.toUpperCase()+' done!','success');setTimeout(updateUI,500);}}).catch(function(){btn.disabled=false;btn.innerHTML=origHtml;showNotification('Failed','error');});
 }
 
 function openRecreateModal(){document.getElementById('recreateModal').classList.add('active');}
@@ -5965,9 +5408,9 @@ function openAdminPanel(){
 }
 function closeAdminPanel(){document.getElementById('adminModal').classList.remove('active');}
 document.getElementById('adminModal') && document.getElementById('adminModal').addEventListener('click',function(e){if(e.target===this)closeAdminPanel();});
-function updateAdminUIDs(){var input=document.getElementById('adminUidsInput').value;var uids=input.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});if(!uids.length){showNotification('Enter UIDs','error');if(window.mahirSpeak)window.mahirSpeak('ইউ আই ডি দিন');return;}var btn=document.getElementById('adminUidsBtn');setLoading(btn,true);fetch('/api/admin_uids',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:uids})}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);if(data.status==='success'){showNotification('Updated!','success');if(window.mahirSpeak)window.mahirSpeak('অ্যাডমিন ইউ আই ডি আপডেট হয়েছে');setTimeout(updateUI,3000);}else{showNotification('Failed','error');if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');}});}
-function updateBotCreds(){var uid=document.getElementById('botUidInput').value.trim();var pw=document.getElementById('botPwInput').value.trim();if(!uid||!pw){showNotification('Fill both','error');if(window.mahirSpeak)window.mahirSpeak('সব ঘর পূরণ করুন');return;}var btn=document.getElementById('botCredsBtn');setLoading(btn,true);fetch('/api/bot_creds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:uid,pw:pw})}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);if(data.status==='success'){showNotification('Updated!','success');if(window.mahirSpeak)window.mahirSpeak('বট ক্রেডেনশিয়াল সেভ হয়েছে');setTimeout(updateUI,3000);}else{showNotification('Failed','error');if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');}});}
-function friendAction(action){var uid=document.getElementById('friendUidInput').value.trim();if(action!=='list'&&!uid){showNotification('Enter UID','error');if(window.mahirSpeak)window.mahirSpeak('ইউ আই ডি দিন');return;}var btnMap={add:'friendAddBtn',remove:'friendRemoveBtn',list:'friendListBtn'};var btn=document.getElementById(btnMap[action]);setLoading(btn,true);var payload={action:action};if(uid)payload.uid=uid;document.getElementById('friendResult').innerHTML='Loading...';fetch('/api/friend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);var t='';var ok=(data&&data.status==='success');if(action==='list'){if(ok&&data.friends){t='Friends:\\n'+(data.friends.length?data.friends.map(function(f,i){return (i+1)+'. '+f.name+' ('+f.uid+')';}).join('\\n'):'Empty');if(window.mahirSpeak)window.mahirSpeak('ফ্রেন্ড লিস্ট লোড হয়েছে');}else{t='Error: '+(data.message||'');if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');}}else{t=JSON.stringify(data,null,2);if(window.mahirSpeak){if(action==='add')window.mahirSpeak(ok?'অ্যাড রিকোয়েস্ট পাঠানো হয়েছে':'অ্যাড ব্যর্থ হয়েছে');else if(action==='remove')window.mahirSpeak(ok?'ফ্রেন্ড রিমুভ হয়েছে':'রিমুভ ব্যর্থ হয়েছে');}}document.getElementById('friendResult').innerHTML=escapeHtml(t).replace(/\\n/g,'<br>');}).catch(function(){setLoading(btn,false);if(window.mahirSpeak)window.mahirSpeak('সমস্যা হয়েছে');});}
+function updateAdminUIDs(){var input=document.getElementById('adminUidsInput').value;var uids=input.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});if(!uids.length){showNotification('Enter UIDs','error');return;}var btn=document.getElementById('adminUidsBtn');setLoading(btn,true);fetch('/api/admin_uids',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uids:uids})}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);if(data.status==='success'){showNotification('Updated!','success');setTimeout(updateUI,3000);}else showNotification('Failed','error');});}
+function updateBotCreds(){var uid=document.getElementById('botUidInput').value.trim();var pw=document.getElementById('botPwInput').value.trim();if(!uid||!pw){showNotification('Fill both','error');return;}var btn=document.getElementById('botCredsBtn');setLoading(btn,true);fetch('/api/bot_creds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:uid,pw:pw})}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);if(data.status==='success'){showNotification('Updated!','success');setTimeout(updateUI,3000);}else showNotification('Failed','error');});}
+function friendAction(action){var uid=document.getElementById('friendUidInput').value.trim();if(action!=='list'&&!uid){showNotification('Enter UID','error');return;}var btnMap={add:'friendAddBtn',remove:'friendRemoveBtn',list:'friendListBtn'};var btn=document.getElementById(btnMap[action]);setLoading(btn,true);var payload={action:action};if(uid)payload.uid=uid;document.getElementById('friendResult').innerHTML='Loading...';fetch('/api/friend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(data){setLoading(btn,false);var t='';if(action==='list'){if(data.status==='success'&&data.friends){t='Friends:\\n'+(data.friends.length?data.friends.map(function(f,i){return (i+1)+'. '+f.name+' ('+f.uid+')';}).join('\\n'):'Empty');}else{t='Error: '+(data.message||'');}}else{t=JSON.stringify(data,null,2);}document.getElementById('friendResult').innerHTML=escapeHtml(t).replace(/\\n/g,'<br>');});}
 
 function updateUI(){
   if(IS_BLOCKED) return;
@@ -5990,7 +5433,7 @@ setInterval(updateUI,1500);updateUI();
 // Voice greeting after login
 (function(){
   function speak(text){try{if(!window.speechSynthesis)return;window.speechSynthesis.cancel();var u=new SpeechSynthesisUtterance(text);u.lang='en-US';u.rate=0.95;window.speechSynthesis.speak(u);}catch(e){}}
-  function playBeep(){if(window.mahirVoiceEnabled&&!window.mahirVoiceEnabled())return;try{var ctx=new(window.AudioContext||window.webkitAudioContext)();var o=ctx.createOscillator();var g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=880;o.type='sine';g.gain.setValueAtTime(0.08,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.25);o.start();o.stop(ctx.currentTime+0.25);}catch(e){}}
+  function playBeep(){try{var ctx=new(window.AudioContext||window.webkitAudioContext)();var o=ctx.createOscillator();var g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=880;o.type='sine';g.gain.setValueAtTime(0.08,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.25);o.start();o.stop(ctx.currentTime+0.25);}catch(e){}}
   {% if just_logged_in %}
   setTimeout(function(){playBeep();speak("Welcome {{ voice_name or 'User' }}. Your Mahir bot panel is ready.");},700);
   {% endif %}
@@ -6092,599 +5535,6 @@ def handle_unexpected(e):
     return redirect(url_for('login'))
 
 
-
-# ============================================================
-#  TRUSTED DEVICE (auto-login) + VOICE PREFERENCE
-#  - কেউ আটকায় না: যেকোনো device-এ password দিয়ে login চলবে
-#  - "Verify this device" চাপলে শুধু সেই device পরের বার password ছাড়া auto login হবে
-#  - Voice/welcome on-off account-এ সেভ থাকে, পরের login-এও মানা হয়
-#  - আলাদা DB ফাইল (mahir_devices.db) → users.db আপলোডে মুছে যায় না
-# ============================================================
-import hashlib as _hl
-
-DEVICES_DB = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)) or '.', 'mahir_devices.db')
-TRUST_DAYS = 90
-_LOGIN_PATHS = ('/login', '/agent/login', '/owner/login')
-
-
-def _dev_conn():
-    conn = sqlite3.connect(DEVICES_DB, timeout=30)
-    try:
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA busy_timeout=30000')
-    except Exception:
-        pass
-    return conn
-
-
-def _init_devices_db():
-    conn = _dev_conn()
-    conn.execute("""CREATE TABLE IF NOT EXISTS trusted_devices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL, username TEXT, role TEXT,
-        token_hash TEXT UNIQUE NOT NULL,
-        label TEXT, ip TEXT, created_at TEXT, last_used TEXT, expires_at TEXT)""")
-    conn.execute("CREATE TABLE IF NOT EXISTS voice_pref (user_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 1)")
-    conn.commit(); conn.close()
-
-
-_init_devices_db()
-
-
-def _client_ip():
-    xff = request.headers.get('X-Forwarded-For', '')
-    return (xff.split(',')[0].strip() if xff else request.remote_addr) or '?'
-
-
-def _now_s():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
-def _hash_tok(tok):
-    return _hl.sha256(tok.encode()).hexdigest()
-
-
-def _voice_pref(uid):
-    try:
-        conn = _dev_conn()
-        row = conn.execute('SELECT enabled FROM voice_pref WHERE user_id=?', (uid,)).fetchone()
-        conn.close()
-        return 1 if (row is None or row[0]) else 0
-    except Exception:
-        return 1
-
-
-def _session_role():
-    if session.get('owner_mode') or session.get('user_id') == -1:
-        return 'owner'
-    return 'agent' if session.get('is_agent') else ('admin' if session.get('is_admin') else 'user')
-
-
-@app.before_request
-def _trusted_autologin():
-    """Logout অবস্থায় বিশ্বস্ত device-এর cookie থাকলে password ছাড়াই session চালু।"""
-    if request.endpoint == 'static' or session.get('user_id') is not None:
-        return
-    if request.path.endswith('logout') or request.cookies.get('mahir_noauto'):
-        return
-    tok = request.cookies.get('mahir_trust')
-    if not tok:
-        return
-    try:
-        conn = _dev_conn()
-        row = conn.execute('SELECT id, user_id, role FROM trusted_devices WHERE token_hash=? AND expires_at>?',
-                           (_hash_tok(tok), _now_s())).fetchone()
-        if not row:
-            conn.close()
-            return
-        dev_id, uid, role = row
-        if uid == -1 or role == 'owner':
-            session.clear()
-            session['user_id'] = -1; session['username'] = 'OWNER'
-            session['is_admin'] = True; session['is_agent'] = False
-            session['owner_mode'] = True; session['voice_name'] = 'Owner Mahir'
-        else:
-            mc = get_db_connection()
-            u = mc.execute('SELECT id, username, is_admin, is_agent FROM users WHERE id=?', (uid,)).fetchone()
-            mc.close()
-            if not u:
-                conn.execute('DELETE FROM trusted_devices WHERE id=?', (dev_id,))
-                conn.commit(); conn.close()
-                return
-            if not u[2] and dev_setting('enabled') == '1':
-                _ensure_device_id()
-                if device_status(u[0]) != 'approved':
-                    conn.close()
-                    return
-            session.clear()
-            session['user_id'] = u[0]; session['username'] = u[1]
-            session['is_admin'] = bool(u[2]); session['is_agent'] = bool(u[3])
-            session['voice_name'] = u[1]
-        session.permanent = True
-        session['just_logged_in'] = True
-        conn.execute('UPDATE trusted_devices SET last_used=?, ip=? WHERE id=?', (_now_s(), _client_ip(), dev_id))
-        conn.commit(); conn.close()
-    except Exception as e:
-        print(f"[trusted-autologin] {e}")
-
-
-@app.after_request
-def _trust_cookies(resp):
-    try:
-        path = request.path
-        if path.endswith('logout'):
-            # স্পষ্টভাবে logout করলে browser বন্ধ না হওয়া পর্যন্ত auto login হবে না
-            resp.set_cookie('mahir_noauto', '1', httponly=True, samesite='Lax')
-        elif request.method == 'POST' and path in _LOGIN_PATHS and resp.status_code == 302:
-            resp.delete_cookie('mahir_noauto')
-            if session.get('user_id') is not None:
-                resp.set_cookie('mahir_voice', str(_voice_pref(session['user_id'])), max_age=63072000, samesite='Lax')
-        elif session.get('user_id') is not None and request.cookies.get('mahir_voice') is None:
-            resp.set_cookie('mahir_voice', str(_voice_pref(session['user_id'])), max_age=63072000, samesite='Lax')
-    except Exception:
-        pass
-    return resp
-
-
-def _need_login():
-    return session.get('user_id') is None
-
-
-@app.route('/api/device/status')
-def api_device_status():
-    if _need_login():
-        return jsonify({'error': 'login'}), 401
-    trusted = False
-    tok = request.cookies.get('mahir_trust')
-    if tok:
-        conn = _dev_conn()
-        row = conn.execute('SELECT 1 FROM trusted_devices WHERE token_hash=? AND user_id=? AND expires_at>?',
-                           (_hash_tok(tok), session['user_id'], _now_s())).fetchone()
-        conn.close()
-        trusted = bool(row)
-    return jsonify({'trusted': trusted, 'voice': bool(_voice_pref(session['user_id']))})
-
-
-@app.route('/api/device/trust', methods=['POST'])
-def api_device_trust():
-    if _need_login():
-        return jsonify({'error': 'login'}), 401
-    tok = secrets.token_urlsafe(32)
-    exp = (datetime.now() + timedelta(days=TRUST_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
-    conn = _dev_conn()
-    old = request.cookies.get('mahir_trust')
-    if old:
-        conn.execute('DELETE FROM trusted_devices WHERE token_hash=?', (_hash_tok(old),))
-    conn.execute('INSERT INTO trusted_devices (user_id, username, role, token_hash, label, ip, created_at, last_used, expires_at) '
-                 'VALUES (?,?,?,?,?,?,?,?,?)',
-                 (session['user_id'], session.get('username'), _session_role(), _hash_tok(tok),
-                  (request.headers.get('User-Agent') or '')[:160], _client_ip(), _now_s(), _now_s(), exp))
-    conn.commit(); conn.close()
-    resp = jsonify({'trusted': True})
-    secure = request.headers.get('X-Forwarded-Proto', request.scheme) == 'https'
-    resp.set_cookie('mahir_trust', tok, max_age=60 * 60 * 24 * TRUST_DAYS, httponly=True, samesite='Lax', secure=secure)
-    return resp
-
-
-@app.route('/api/device/untrust', methods=['POST'])
-def api_device_untrust():
-    tok = request.cookies.get('mahir_trust')
-    if tok:
-        conn = _dev_conn()
-        conn.execute('DELETE FROM trusted_devices WHERE token_hash=?', (_hash_tok(tok),))
-        conn.commit(); conn.close()
-    resp = jsonify({'trusted': False})
-    resp.delete_cookie('mahir_trust')
-    return resp
-
-
-@app.route('/api/voice_pref', methods=['POST'])
-def api_voice_pref():
-    if _need_login():
-        return jsonify({'error': 'login'}), 401
-    enabled = 1 if (request.get_json(silent=True) or {}).get('enabled', True) else 0
-    conn = _dev_conn()
-    conn.execute('INSERT INTO voice_pref (user_id, enabled) VALUES (?,?) '
-                 'ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled', (session['user_id'], enabled))
-    conn.commit(); conn.close()
-    return jsonify({'enabled': bool(enabled)})
-
-
-def _devices_scope_ids():
-    """None = সবাই (Owner); নাহলে agent-এর নিজের user id-র set।"""
-    if session.get('is_admin'):
-        return None
-    conn = get_db_connection()
-    ids = {r[0] for r in conn.execute(
-        'SELECT id FROM users WHERE created_by_agent=? AND is_admin=0 AND is_agent=0', (session.get('username'),)).fetchall()}
-    conn.close()
-    return ids
-
-
-# ============================================================
-#  DEVICE VERIFICATION (approval layer) — User + Agent; Owner exempt
-#  - Login/Register-এ fingerprint (browser + screen + timezone + canvas)
-#  - প্রথম device auto-trust · নতুন device → Owner approve · limit পার হলে block
-#  - Owner panel: settings + সব device Trust / Block / Delete
-#  - "Verify this device" (উপরের auto-login) আলাদা: approved device-এ চাপলে password লাগে না
-# ============================================================
-_DEV_CACHE = {}
-_DEV_CACHE_TTL = 20
-DEV_DEFAULTS = {'enabled': '1', 'max_devices': '2'}
-
-
-def _init_registry_db():
-    conn = _dev_conn()
-    conn.execute("""CREATE TABLE IF NOT EXISTS user_devices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        device_id TEXT NOT NULL,
-        label TEXT, ip TEXT,
-        status TEXT DEFAULT 'pending',
-        first_seen TEXT, last_seen TEXT,
-        fp TEXT, note TEXT,
-        UNIQUE(user_id, device_id))""")
-    conn.execute("CREATE TABLE IF NOT EXISTS dev_settings (key TEXT PRIMARY KEY, value TEXT)")
-    conn.commit(); conn.close()
-
-
-_init_registry_db()
-
-
-def dev_setting(key):
-    try:
-        conn = _dev_conn()
-        row = conn.execute('SELECT value FROM dev_settings WHERE key=?', (key,)).fetchone()
-        conn.close()
-        if row and row[0] is not None:
-            return row[0]
-    except Exception:
-        pass
-    return DEV_DEFAULTS.get(key, '')
-
-
-def set_dev_setting(key, value):
-    conn = _dev_conn()
-    conn.execute('INSERT INTO dev_settings (key, value) VALUES (?, ?) '
-                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
-    conn.commit(); conn.close()
-
-
-def _ensure_device_id():
-    if getattr(g, 'device_id', None):
-        return
-    cookie = request.cookies.get('mahir_did')
-    g.device_id = cookie or secrets.token_hex(16)
-    g.set_device_cookie = not cookie
-
-
-def _client_fp():
-    fp = request.form.get('fp', '') if request.method == 'POST' else ''
-    fp = fp or request.cookies.get('mahir_fp', '')
-    return re.sub(r'[^0-9a-zA-Z]', '', fp)[:64]
-
-
-def device_state(user_id):
-    """(status, note): approved | pending | blocked. নতুন device হলে registry-তে যোগ করে।"""
-    _ensure_device_id()
-    did = g.device_id
-    key = (user_id, did)
-    hit = _DEV_CACHE.get(key)
-    now = time.time()
-    if hit and now - hit[1] < _DEV_CACHE_TTL:
-        return hit[0], ''
-    fp = _client_fp()
-    ts = _now_s()
-    enabled = dev_setting('enabled') == '1'
-    try:
-        max_dev = max(1, int(dev_setting('max_devices') or 2))
-    except ValueError:
-        max_dev = 2
-    conn = _dev_conn()
-    note = ''
-    try:
-        row = conn.execute('SELECT id, status, note FROM user_devices WHERE user_id=? AND device_id=?', (user_id, did)).fetchone()
-        if not row and fp:   # cookie মুছলেও একই fingerprint = একই device
-            row = conn.execute("SELECT id, status, note FROM user_devices WHERE user_id=? AND fp=? "
-                               "ORDER BY (status='approved') DESC LIMIT 1", (user_id, fp)).fetchone()
-        if row:
-            status, note = row[1], row[2] or ''
-            conn.execute("UPDATE user_devices SET device_id=?, last_seen=?, ip=?, fp=COALESCE(NULLIF(?, ''), fp) WHERE id=?",
-                         (did, ts, _client_ip(), fp, row[0]))
-        else:
-            n = conn.execute("SELECT COUNT(*) FROM user_devices WHERE user_id=? AND status='approved'", (user_id,)).fetchone()[0]
-            if not enabled or n == 0:
-                status = 'approved'
-            elif n >= max_dev:
-                status, note = 'blocked', 'limit'
-            else:
-                status = 'pending'
-            conn.execute('INSERT INTO user_devices (user_id, device_id, label, ip, status, first_seen, last_seen, fp, note) '
-                         'VALUES (?,?,?,?,?,?,?,?,?)',
-                         (user_id, did, (request.headers.get('User-Agent') or '')[:160] or 'unknown',
-                          _client_ip(), status, ts, ts, fp, note))
-        conn.commit()
-    finally:
-        conn.close()
-    if status == 'approved':
-        _DEV_CACHE[key] = (status, now)
-    return status, note
-
-
-def device_status(user_id):
-    return device_state(user_id)[0]
-
-
-@app.before_request
-def _device_guard():
-    _ensure_device_id()
-    if request.endpoint == 'static':
-        return
-    uid = session.get('user_id')
-    if uid is None or uid < 0 or session.get('is_admin') or session.get('owner_mode'):
-        return
-    if dev_setting('enabled') != '1':
-        return
-    if request.path.endswith('logout') or request.path in ('/login', '/agent/login'):
-        return
-    if device_status(uid) == 'approved':
-        return
-    session.clear()
-    if request.path.startswith('/api/'):
-        return jsonify({'error': '⛔ এই device approved না। আবার login করুন।'}), 401
-    flash('⛔ এই device approved নয় — Owner-এর approval লাগবে।', 'error')
-    return redirect(url_for('login'))
-
-
-_FP_SCRIPT = r"""<script>
-(function(){try{
- function h(s){var a=0xdeadbeef,b=0x41c6ce57,c;for(var i=0;i<s.length;i++){c=s.charCodeAt(i);a=Math.imul(a^c,2654435761);b=Math.imul(b^c,1597334677);}
-  a=Math.imul(a^(a>>>16),2246822507)^Math.imul(b^(b>>>13),3266489909);b=Math.imul(b^(b>>>16),2246822507)^Math.imul(a^(a>>>13),3266489909);
-  return (4294967296*(2097151&b)+(a>>>0)).toString(16);}
- var cs='';
- try{var cv=document.createElement('canvas');cv.width=220;cv.height=40;var x=cv.getContext('2d');x.textBaseline='top';x.font='16px Arial';
-  x.fillStyle='#f60';x.fillRect(10,5,100,25);x.fillStyle='#069';x.fillText('Mahir-FP-\u2603-Cwm',12,8);
-  x.fillStyle='rgba(102,204,0,0.7)';x.fillText('Mahir-FP-\u2603-Cwm',14,10);cs=cv.toDataURL();}catch(e){}
- var tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'';}catch(e){}
- var p=[navigator.userAgent,navigator.language,navigator.platform,screen.width+'x'+screen.height+'x'+screen.colorDepth,
-  window.devicePixelRatio||1,tz,new Date().getTimezoneOffset(),navigator.hardwareConcurrency||0,h(cs)].join('||');
- var fp=h(p)+h('m'+p);
- document.cookie='mahir_fp='+fp+';path=/;max-age=63072000;SameSite=Lax';
- function put(){var f=document.forms;for(var i=0;i<f.length;i++){if(f[i].querySelector('input[name=fp]'))continue;
-  var inp=document.createElement('input');inp.type='hidden';inp.name='fp';inp.value=fp;f[i].appendChild(inp);}}
- if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',put);else put();
-}catch(e){}})();
-</script>"""
-
-
-@app.after_request
-def _device_after(resp):
-    try:
-        if getattr(g, 'set_device_cookie', False) and getattr(g, 'device_id', None):
-            secure = request.headers.get('X-Forwarded-Proto', request.scheme) == 'https'
-            resp.set_cookie('mahir_did', g.device_id, max_age=60 * 60 * 24 * 730,
-                            httponly=True, samesite='Lax', secure=secure)
-        if (request.path in ('/login', '/register', '/agent/login') and resp.status_code == 200
-                and (resp.mimetype or '') == 'text/html' and not resp.direct_passthrough):
-            html = resp.get_data(as_text=True)
-            html = html.replace('</body>', _FP_SCRIPT + '</body>', 1) if '</body>' in html else html + _FP_SCRIPT
-            resp.set_data(html)
-    except Exception:
-        pass
-    return resp
-
-
-def device_gate(user_id):
-    """Login-এর সময়: approved হলে True; নাহলে কারণসহ flash দিয়ে False।"""
-    st, note = device_state(user_id)
-    if st == 'approved':
-        return True
-    if st == 'blocked' and note == 'limit':
-        flash('⛔ Device limit পূর্ণ — আপনার সর্বোচ্চ device সংখ্যা ব্যবহার হয়ে গেছে। Owner-এর সাথে যোগাযোগ করুন। '
-              f'(Device ID: {g.device_id[:8]})', 'error')
-    elif st == 'blocked':
-        flash('⛔ এই device block করা আছে। Owner-এর সাথে যোগাযোগ করুন।', 'error')
-    else:
-        flash('🔐 নতুন device শনাক্ত হয়েছে। Owner approve করলে তারপর login করতে পারবেন। '
-              f'(Device ID: {g.device_id[:8]})', 'error')
-    return False
-
-
-def _scope_users():
-    """{id: (username, is_agent)} — Owner সবাই; Agent শুধু নিজের তৈরি user।"""
-    conn = get_db_connection()
-    try:
-        if session.get('is_admin'):
-            rows = conn.execute('SELECT id, username, is_agent FROM users WHERE is_admin=0').fetchall()
-        else:
-            rows = conn.execute('SELECT id, username, is_agent FROM users WHERE created_by_agent=? AND is_admin=0 AND is_agent=0',
-                                (session.get('username'),)).fetchall()
-    finally:
-        conn.close()
-    return {r[0]: (r[1], r[2]) for r in rows}
-
-
-DEVICES_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Device Verification</title>
-<style>
-body{margin:0;padding:16px;background:#0e0e14;color:#eee;font-family:system-ui,sans-serif}
-h2{margin:0 0 12px}h3{margin:18px 0 8px}a{color:#6cf}
-.card{background:#171722;border:1px solid #2a2a3a;border-radius:12px;padding:12px;margin-bottom:10px}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between}
-.tag{padding:2px 10px;border-radius:99px;font-size:12px;font-weight:700}
-.approved{background:#12351f;color:#4be37f}.pending{background:#3a2f0b;color:#ffd24a}.blocked{background:#3a1220;color:#ff6b8a}
-button{border:0;border-radius:8px;padding:6px 12px;font-weight:700;cursor:pointer;color:#111}
-.b-ok{background:#4be37f}.b-no{background:#ff6b8a}.b-del{background:#aaa}.b-rst{background:#ffd24a}.b-go{background:#6cf}
-small{color:#9a9ab0;word-break:break-all}
-input[type=number],input[type=text]{background:#0e0e14;color:#eee;border:1px solid #333;border-radius:8px;padding:6px 8px}
-label{margin-right:14px}.tabs a{margin-right:8px;text-decoration:none;padding:4px 10px;border-radius:99px;background:#222;display:inline-block;margin-bottom:6px}
-.tabs a.on{background:#6cf;color:#111}
-</style></head><body>
-<h2>🛡 Device Verification</h2>
-<p><a href="{{ back }}">← Back</a></p>
-{% with m = get_flashed_messages() %}{% for x in m %}<div class="card">{{ x }}</div>{% endfor %}{% endwith %}
-{% if is_owner %}
-<div class="card"><form method="post" action="/owner/devices/settings">
-  <b>Settings</b><br><br>
-  <label><input type="checkbox" name="enabled" {% if st.enabled == '1' %}checked{% endif %}> Device verification চালু</label><br><br>
-  <label>প্রতি user সর্বোচ্চ trusted device: <input type="number" name="max_devices" min="1" max="50" value="{{ st.max_devices }}" style="width:70px"></label>
-  <button class="b-go" type="submit">Save</button><br>
-  <small>প্রথম device auto-trust · লিমিট পূর্ণ হলে নতুন device auto-block · লিমিটের নিচে হলে Pending (আপনি Trust করবেন)</small>
-</form></div>
-{% endif %}
-<div class="tabs">
-  {% for k,l in tabs %}<a class="{{ 'on' if f == k else '' }}" href="?s={{ k }}&q={{ q }}">{{ l }}</a>{% endfor %}
-  <form method="get" style="display:inline"><input type="hidden" name="s" value="{{ f }}"><input type="text" name="q" value="{{ q }}" placeholder="username খুঁজুন"> <button class="b-go">Search</button></form>
-</div>
-{% if not rows %}<div class="card">কোনো device নেই।</div>{% endif %}
-{% for r in rows %}
-<div class="card"><div class="row">
-  <div><b>{{ r.username }}</b>{% if r.is_agent %} (agent){% endif %} <span class="tag {{ r.status }}">{{ 'trusted' if r.status == 'approved' else r.status }}</span>{% if r.note == 'limit' %} <small>(limit পূর্ণ)</small>{% endif %}<br>
-  <small>{{ r.ip }} · first {{ r.first_seen }} · last {{ r.last_seen }}<br>{{ r.label }}<br>ID {{ r.device_id[:8] }} · FP {{ (r.fp or '-')[:8] }}</small></div>
-  <form method="post" action="/devices/action" style="display:flex;gap:6px;flex-wrap:wrap">
-    <input type="hidden" name="kind" value="reg"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="back" value="{{ back_self }}">
-    {% if r.status != 'approved' %}<button class="b-ok" name="act" value="approve">Trust</button>{% endif %}
-    {% if r.status != 'blocked' %}<button class="b-no" name="act" value="block">Block</button>{% endif %}
-    <button class="b-del" name="act" value="delete" onclick="return confirm('Delete?')">Delete</button>
-    <button class="b-rst" name="act" value="reset_user" onclick="return confirm('এই user-এর সব device মুছবেন? পরের login-এর device আবার প্রথম হিসেবে trust হবে।')">Reset user</button>
-  </form></div></div>
-{% endfor %}
-<h3>🔐 Auto-login (Verify this device চাপা)</h3>
-{% if not tokens %}<div class="card">কোনো auto-login device নেই।</div>{% endif %}
-{% for r in tokens %}
-<div class="card"><div class="row">
-  <div><b>{{ r.username }}</b> <small>({{ r.role }})</small><br>
-  <small>{{ r.ip }} · verified {{ r.created_at }} · last used {{ r.last_used }} · expires {{ r.expires_at }}<br>{{ r.label }}</small></div>
-  <form method="post" action="/devices/action" style="display:flex;gap:6px;flex-wrap:wrap">
-    <input type="hidden" name="kind" value="tok"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="back" value="{{ back_self }}">
-    <button class="b-del" name="act" value="delete">Remove</button>
-    <button class="b-rst" name="act" value="reset_user" onclick="return confirm('এই user-এর সব auto-login device মুছবেন?')">Remove all of user</button>
-  </form></div></div>
-{% endfor %}</body></html>"""
-
-
-def _devices_page(back, back_self):
-    f = request.args.get('s', 'all')
-    q = (request.args.get('q') or '').strip().lower()
-    scope = _scope_users()
-    rows, counts = [], {'all': 0, 'pending': 0, 'approved': 0, 'blocked': 0}
-    tokens = []
-    dc = _dev_conn()
-    try:
-        if scope:
-            qs = ','.join('?' * len(scope))
-            order = "CASE status WHEN 'pending' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END, last_seen DESC"
-            for r in dc.execute(f'SELECT id,user_id,device_id,label,ip,status,first_seen,last_seen,fp,note FROM user_devices '
-                                f'WHERE user_id IN ({qs}) ORDER BY {order}', list(scope.keys())).fetchall():
-                name = scope[r[1]][0]
-                if q and q not in name.lower():
-                    continue
-                counts['all'] += 1
-                counts[r[5]] = counts.get(r[5], 0) + 1
-                if f != 'all' and r[5] != f:
-                    continue
-                rows.append({'id': r[0], 'username': name, 'is_agent': scope[r[1]][1], 'device_id': r[2], 'label': r[3],
-                             'ip': r[4], 'status': r[5], 'first_seen': r[6], 'last_seen': r[7], 'fp': r[8], 'note': r[9]})
-        scope_ids = None if session.get('is_admin') else set(scope.keys())
-        for r in dc.execute('SELECT id,user_id,username,role,ip,label,created_at,last_used,expires_at FROM trusted_devices ORDER BY last_used DESC').fetchall():
-            if scope_ids is None or r[1] in scope_ids:
-                tokens.append(dict(zip(('id', 'user_id', 'username', 'role', 'ip', 'label', 'created_at', 'last_used', 'expires_at'), r)))
-    finally:
-        dc.close()
-    tabs = [('all', f"All ({counts['all']})"), ('pending', f"Pending ({counts['pending']})"),
-            ('approved', f"Trusted ({counts['approved']})"), ('blocked', f"Blocked ({counts['blocked']})")]
-    return render_template_string(DEVICES_HTML, rows=rows, tokens=tokens, back=back, back_self=back_self,
-                                  is_owner=bool(session.get('is_admin')), st={k: dev_setting(k) for k in DEV_DEFAULTS},
-                                  tabs=tabs, f=f, q=q)
-
-
-@app.route('/owner/devices')
-@owner_required
-def owner_devices():
-    return _devices_page('/owner/dashboard', '/owner/devices')
-
-
-@app.route('/agent/devices')
-@agent_required
-def agent_devices():
-    return _devices_page('/agent/dashboard', '/agent/devices')
-
-
-@app.route('/owner/devices/settings', methods=['POST'])
-@owner_required
-def owner_devices_settings():
-    set_dev_setting('enabled', '1' if request.form.get('enabled') else '0')
-    try:
-        mx = min(50, max(1, int(request.form.get('max_devices', 2))))
-    except ValueError:
-        mx = 2
-    set_dev_setting('max_devices', mx)
-    _DEV_CACHE.clear()
-    flash('✅ Device settings saved', 'success')
-    return redirect('/owner/devices')
-
-
-@app.route('/api/devices/pending')
-def api_devices_pending():
-    if not (session.get('is_admin') or session.get('is_agent')):
-        return jsonify({'count': 0})
-    scope = _scope_users()
-    if not scope:
-        return jsonify({'count': 0})
-    dc = _dev_conn()
-    try:
-        qs = ','.join('?' * len(scope))
-        n = dc.execute(f"SELECT COUNT(*) FROM user_devices WHERE status='pending' AND user_id IN ({qs})", list(scope.keys())).fetchone()[0]
-    finally:
-        dc.close()
-    return jsonify({'count': n})
-
-
-@app.route('/devices/action', methods=['POST'])
-def devices_action():
-    if not (session.get('is_admin') or session.get('is_agent')):
-        return redirect(url_for('login'))
-    back = request.form.get('back')
-    if back not in ('/owner/devices', '/agent/devices'):
-        back = '/owner/devices' if session.get('is_admin') else '/agent/devices'
-    try:
-        dev_id = int(request.form.get('id', 0))
-    except ValueError:
-        return redirect(back)
-    kind = request.form.get('kind', 'reg')
-    act = request.form.get('act')
-    scope = _scope_users()
-    table = 'trusted_devices' if kind == 'tok' else 'user_devices'
-    dc = _dev_conn()
-    try:
-        row = dc.execute(f'SELECT user_id FROM {table} WHERE id=?', (dev_id,)).fetchone()
-        if not row or (row[0] not in scope and not (session.get('is_admin') and kind == 'tok')):
-            flash('Not allowed', 'error')
-            return redirect(back)
-        uid = row[0]
-        if kind == 'tok':
-            if act == 'reset_user':
-                dc.execute('DELETE FROM trusted_devices WHERE user_id=?', (uid,))
-            else:
-                dc.execute('DELETE FROM trusted_devices WHERE id=?', (dev_id,))
-        elif act == 'approve':
-            dc.execute("UPDATE user_devices SET status='approved', note='' WHERE id=?", (dev_id,))
-        elif act == 'block':
-            dc.execute("UPDATE user_devices SET status='blocked', note='' WHERE id=?", (dev_id,))
-            dc.execute('DELETE FROM trusted_devices WHERE user_id=?', (uid,))   # block করলে auto-login টোকেনও বাতিল
-        elif act == 'delete':
-            dc.execute('DELETE FROM user_devices WHERE id=?', (dev_id,))
-        elif act == 'reset_user':
-            dc.execute('DELETE FROM user_devices WHERE user_id=?', (uid,))
-        dc.commit()
-    finally:
-        dc.close()
-    _DEV_CACHE.clear()
-    flash('✅ Done', 'success')
-    return redirect(back)
-
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -6696,8 +5546,6 @@ def login():
         user = c.fetchone()
         conn.close()
         if user and check_password(user[2], password):
-            if not user[3] and not device_gate(user[0]):
-                return render_template_string(LOGIN_HTML, **_auth_page_ctx())
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_admin'] = bool(user[3]); session['is_agent'] = bool(user[4])
             session.permanent = True
@@ -6741,14 +5589,7 @@ def register():
         c.execute('''INSERT INTO users (username, password, email, registration_key, is_admin, is_agent, subscription_expiry, created_by_agent)
                      VALUES (?, ?, ?, ?, 0, 0, ?, ?)''', (username, password, email, reg_key, key_row[1], agent_name))
         c.execute('UPDATE keys SET is_used=1, used_by=?, used_at=CURRENT_TIMESTAMP WHERE key=?', (username, reg_key))
-        conn.commit()
-        try:
-            _row = conn.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone()
-            if _row:
-                device_status(_row[0])
-        except Exception as _e:
-            print(f"[register-device] {_e}")
-        conn.close()
+        conn.commit(); conn.close()
         flash('Registration successful!', 'success')
         return redirect(url_for('login'))
     return render_template_string(REGISTER_HTML, **_auth_page_ctx())
@@ -6797,8 +5638,6 @@ def agent_login():
         user = c.fetchone()
         conn.close()
         if user and user[3] == 1 and check_password(user[2], password):
-            if not device_gate(user[0]):
-                return render_template_string(AGENT_LOGIN_HTML, **_auth_page_ctx())
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_agent'] = True; session['is_admin'] = False
             session.permanent = True
@@ -6870,17 +5709,10 @@ def agent_dashboard():
     # ✅ NEW: session থেকে freshly generated key নিন (one-time use)
     new_key_data = session.pop('new_key_generated', None)
 
-    max_bots = get_max_running_bots()
-    running_now = count_running_bots()
-    limit_full = is_bot_limit_full()
-
     return render_template_string(AGENT_DASHBOARD_HTML, keys=keys, new_key=None,
                                   key_limit=key_limit, key_count=len(keys),
                                   can_manage_db=can_manage_db, my_users=my_users,
-                                  new_key_data=new_key_data,
-                                  max_running_bots=max_bots,
-                                  running_bots_count=running_now,
-                                  bot_limit_full=limit_full)
+                                  new_key_data=new_key_data)
 
 
 @app.route('/agent/subscription')
@@ -7042,13 +5874,6 @@ def agent_renew_subscription(user_id):
 @app.route('/agent/create_key', methods=['POST'])
 @agent_required
 def agent_create_key():
-    # Global concurrent bot limit full → agents cannot create new keys
-    if is_bot_limit_full():
-        max_b = get_max_running_bots()
-        running = count_running_bots()
-        flash(f'⛔ বট লিমিট পূর্ণ ({running}/{max_b})! নতুন Key তৈরি করা যাবে না। Owner লিমিট বাড়ান বা বট বন্ধ করুন।', 'error')
-        return redirect(url_for('agent_dashboard'))
-
     days = int(request.form.get('days_valid', 30))
     conn = get_db_connection()
     c = conn.cursor()
@@ -7359,8 +6184,6 @@ def owner_dashboard():
                                   photo_files=list_photo_files(),
                                   just_logged_in=bool(session.pop('just_logged_in', False)),
                                   voice_name=session.pop('voice_name', session.get('username', 'Owner')),
-                                  max_running_bots=get_max_running_bots(),
-                                  running_bots_count=count_running_bots(),
                                   **stats)
 
 
@@ -7549,20 +6372,6 @@ body{{background:#07070f;color:#e9e9f8;font-family:Inter,sans-serif;display:flex
 <div class="msg">{notice}</div></div></body></html>'''
 
 
-@app.route('/owner/notices')
-def owner_notices():
-    if not session.get('is_admin'):
-        flash('Owner access required', 'error')
-        return redirect(url_for('owner_login'))
-    return render_template_string(
-        OWNER_NOTICES_HTML,
-        global_notice=get_global_notice(),
-        login_notice_enabled=is_user_login_notice_enabled(),
-        login_notice_text=get_user_login_notice(),
-        logo_url=get_logo_url(),
-    )
-
-
 @app.route('/owner/set_global_notice', methods=['POST'])
 def owner_set_global_notice():
     if not session.get('is_admin'):
@@ -7570,7 +6379,7 @@ def owner_set_global_notice():
     notice = request.form.get('notice_text', '').strip()
     set_setting('global_notice_text', notice)
     flash('✅ Global notice updated!', 'success')
-    return redirect(url_for('owner_notices'))
+    return redirect(url_for('owner_dashboard'))
 
 
 @app.route('/owner/set_user_login_notice', methods=['POST'])
@@ -7592,7 +6401,7 @@ def owner_set_user_login_notice():
     else:
         set_setting('user_login_notice_text', notice_text)
         flash('✅ Notice text saved!', 'success')
-    return redirect(url_for('owner_notices'))
+    return redirect(url_for('owner_dashboard'))
 
 
 @app.route('/owner/set_user_notice/<int:user_id>', methods=['POST'])
@@ -7630,28 +6439,8 @@ def owner_start_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
     set_setting('global_bot_stop', '0')
-    started = reset_all_bots_async()
-    flash('✅ Global stop OFF! Rebuild + bot start ব্যাকগ্রাউন্ডে চলছে।' if started else '⏳ আগের Reset চলছে।', 'success')
-    return redirect(url_for('owner_dashboard'))
-
-
-@app.route('/owner/set_max_bots', methods=['POST'])
-def owner_set_max_bots():
-    if not session.get('is_admin'):
-        return redirect(url_for('owner_login'))
-    try:
-        val = int(request.form.get('max_running_bots', -1))
-    except Exception:
-        val = -1
-    if val < -1:
-        val = -1
-    if val > 5000:
-        val = 5000
-    set_setting('max_running_bots', str(val))
-    if val < 0:
-        flash('✅ Bot limit set to Unlimited', 'success')
-    else:
-        flash(f'✅ Max concurrent bots set to {val}. Currently running: {count_running_bots()}', 'success')
+    success, fail = reset_all_bots()
+    flash(f'✅ Global stop OFF! Rebuilt + {success} bots started.', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8834,12 +7623,19 @@ def owner_upload_mahir():
     # Save new template
     file.save(MAHIR_SOURCE)
 
-    # ✅ Rebuild + rolling start ব্যাকগ্রাউন্ডে (server freeze এড়াতে)
-    if reset_all_bots_async():
-        flash('✅ mahir.py আপলোড হয়েছে। Bot rebuild + একটা একটা করে restart ব্যাকগ্রাউন্ডে চলছে — '
-              'শেষ হলে /api/owner/reset_status এ দেখতে পারবেন।', 'success')
-    else:
-        flash('⏳ আগের Reset এখনো চলছে। শেষ হওয়ার পর আবার চেষ্টা করুন (mahir.py সেভ হয়েছে)।', 'error')
+    # ✅ Rebuild all bot files with new template + DB creds + delete expired
+    result = rebuild_all_bot_files(delete_expired=True)
+
+    # ✅ Start all eligible bots
+    success, fail, skipped = _start_all_eligible_bots()
+
+    flash(
+        f'✅ mahir.py updated! '
+        f'Bots rebuilt: {result["updated"]}, '
+        f'Expired deleted: {result["deleted_expired"]}, '
+        f'Started: {success}, Failed: {fail}, Skipped: {skipped}',
+        'success'
+    )
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8883,11 +7679,19 @@ def _handle_db_upload(redirect_endpoint):
         flash(f'❌ Replace error: {e}', 'error')
         return redirect(url_for(redirect_endpoint))
 
-    # ✅ Rebuild + rolling start ব্যাকগ্রাউন্ডে
-    if reset_all_bots_async():
-        flash('✅ DB আপলোড হয়েছে। Bot rebuild + restart ব্যাকগ্রাউন্ডে চলছে।', 'success')
-    else:
-        flash('⏳ আগের Reset এখনো চলছে। DB সেভ হয়েছে।', 'error')
+    # ✅ Rebuild all bot files from new DB + fresh mahir.py + delete expired
+    result = rebuild_all_bot_files(delete_expired=True)
+
+    # ✅ Start all eligible bots
+    success, fail, skipped = _start_all_eligible_bots()
+
+    flash(
+        f'✅ DB uploaded! '
+        f'Bots rebuilt: {result["updated"]}, '
+        f'Expired deleted: {result["deleted_expired"]}, '
+        f'Started: {success}, Failed: {fail}, Skipped: {skipped}',
+        'success'
+    )
     return redirect(url_for(redirect_endpoint))
 
 
@@ -8902,9 +7706,8 @@ def owner_upload_users_db():
 def owner_reset_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
-    started = reset_all_bots_async()
-    flash('🔄 Reset ব্যাকগ্রাউন্ডে শুরু হয়েছে — bot গুলো একটা একটা করে চালু হবে। অগ্রগতি: /api/owner/reset_status' if started
-          else '⏳ আগের Reset এখনো চলছে।', 'success')
+    success, fail = reset_all_bots()
+    flash(f'🔄 Reset complete: {success} bots started, {fail} failed. All bot files were rebuilt from mahir.py + DB creds, expired files deleted.', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -9134,35 +7937,10 @@ def api_control():
         return jsonify({'error': 'Not configured'}), 400
     action = request.json.get('action')
     try:
-        if action == 'start':
-            ok = monitor.start_process()
-            if not ok:
-                can, reason = monitor.can_start()
-                if reason == 'limit_reached':
-                    max_b = get_max_running_bots()
-                    return jsonify({
-                        'error': f' Server bot limit full ({count_running_bots()}/{max_b}). Try again later.'
-                    }), 403
-                if reason == 'expired':
-                    return jsonify({'error': '⛔ মেয়াদ শেষ!'}), 403
-                if reason == 'global_stop':
-                    return jsonify({'error': '⛔ Owner global stop চলছে!'}), 403
-                if reason == 'admin_disabled':
-                    return jsonify({'error': '⛔ Owner আপনার বট বন্ধ করেছে!'}), 403
-                return jsonify({'error': f'⛔ Cannot start: {reason}'}), 403
-        elif action == 'stop':
-            monitor.stop_process()
-        elif action == 'reset':
-            ok = monitor.hard_reset()
-            if not ok:
-                can, reason = monitor.can_start()
-                if reason == 'limit_reached':
-                    max_b = get_max_running_bots()
-                    return jsonify({
-                        'error': f'⛔ Server bot limit full ({count_running_bots()}/{max_b}).'
-                    }), 403
-        else:
-            return jsonify({'error': 'Invalid'}), 400
+        if action == 'start': monitor.start_process()
+        elif action == 'stop': monitor.stop_process()
+        elif action == 'reset': monitor.hard_reset()
+        else: return jsonify({'error': 'Invalid'}), 400
         return jsonify({'status': 'ok'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
