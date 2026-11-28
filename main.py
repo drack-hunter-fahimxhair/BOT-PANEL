@@ -884,9 +884,6 @@ def global_bot_keepalive():
             if get_global_stop():
                 time.sleep(8)
                 continue
-            if time.time() < _REBUILD_UNTIL:
-                time.sleep(2)
-                continue
             conn = get_db_connection()
             c = conn.cursor()
             c.execute("""SELECT id, bot_file, desired_bot_state, bot_disabled_by_admin, bot_force_active
@@ -1375,7 +1372,6 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
-            _kill_stray_instances(self.process_name)
 
             try:
                 env_copy = os.environ.copy()
@@ -1409,10 +1405,9 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
-                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(_proc.stdout.readline, ''):
+                        for line in iter(self.process.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1422,8 +1417,6 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
-                    finally:
-                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1441,29 +1434,6 @@ class ProcessMonitor:
                 self.output_lines.append(f"Error: {str(e)}")
                 self.is_running = False
                 return False
-
-    def _log_exit(self, proc):
-        """Process মরলে exit code + কারণ log-এ দেখায় (আগে silent ছিল)।"""
-        try:
-            try:
-                rc = proc.wait(timeout=5)
-            except Exception:
-                rc = proc.poll()
-            if rc is None or self.desired_state == 'stopped':
-                return
-            hints = {
-                -9: 'SIGKILL — সম্ভবত RAM শেষ (OOM) বা কেউ kill করেছে',
-                -15: 'SIGTERM — panel/অন্য process বন্ধ করেছে',
-                -11: 'Segmentation fault — native library crash',
-                0: 'normal exit (script নিজে শেষ হয়েছে)',
-                1: 'error exit — উপরের log দেখুন',
-            }
-            ram = psutil.virtual_memory().percent
-            msg = f"⚠️ BOT PROCESS EXITED code={rc} → {hints.get(rc, 'unexpected exit')} | server RAM {ram}%"
-            self.output_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-            print(f"user={self.user_id} {msg}")
-        except Exception:
-            pass
 
     def _stop_process_internal(self):
         if self.process:
@@ -1600,7 +1570,6 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
-            _kill_stray_instances(self.process_name)
             try:
                 env_copy = os.environ.copy()
                 env_copy['TERM'] = 'xterm'
@@ -1631,10 +1600,9 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
-                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(_proc.stdout.readline, ''):
+                        for line in iter(self.process.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1644,8 +1612,6 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
-                    finally:
-                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1659,40 +1625,6 @@ class ProcessMonitor:
 #  MONITORS
 # ============================================================
 monitors = {}
-
-
-
-_REBUILD_UNTIL = 0   # rebuild চলাকালীন keepalive যেন আধা-লেখা ফাইল চালু না করে
-
-def _kill_stray_instances(script_path, keep_pid=None):
-    """একই bot file-এর পুরনো/orphan/duplicate process kill করে।
-    একই account দুই process-এ login হলে game server আগেরটাকে kick করে,
-    ফলে বট বারবার offline/restart হয়। (start_new_session থাকায় panel restart হলে
-    পুরনো bot process মরে না — সেগুলোই duplicate হয়ে যায়।)"""
-    killed = 0
-    try:
-        target = os.path.basename(script_path)
-        me = os.getpid()
-        for p in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                if p.info['pid'] in (me, keep_pid):
-                    continue
-                cmd = p.info.get('cmdline') or []
-                if len(cmd) < 2 or 'python' not in os.path.basename(cmd[0]).lower():
-                    continue
-                if any(os.path.basename(a) == target for a in cmd[1:4]):
-                    for ch in p.children(recursive=True):
-                        try: ch.kill()
-                        except Exception: pass
-                    p.kill()
-                    killed += 1
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[stray-kill] error: {e}")
-    if killed:
-        print(f"🧹 Killed {killed} duplicate/orphan process(es) of {os.path.basename(script_path)}")
-    return killed
 
 
 def get_monitor(user_id, create_only=True):
@@ -1793,9 +1725,6 @@ def rebuild_all_bot_files(delete_expired=True):
        - সব monitor stop করে দেওয়া হয়
     Return: dict {updated, deleted_expired, failed, total}
     """
-    global _REBUILD_UNTIL
-    _REBUILD_UNTIL = time.time() + 120   # keepalive এই সময় অপেক্ষা করবে
-
     # Stop all monitors first
     with monitors_lock:
         for uid, m in list(monitors.items()):
@@ -1874,7 +1803,6 @@ def rebuild_all_bot_files(delete_expired=True):
                 continue
 
             # -- Non-expired: rebuild fresh --
-            _kill_stray_instances(bot_path)
             shutil.copy2(MAHIR_SOURCE, bot_path)
 
             admin_list = parse_admin_uids(admin_uid)
@@ -1925,11 +1853,9 @@ def _start_all_eligible_bots():
     users = c.fetchall()
     conn.close()
 
-    global _REBUILD_UNTIL
     success = 0
     fail = 0
     skipped = 0
-    launched = []
 
     for user_id, bot_file in users:
         if not bot_file:
@@ -1977,35 +1903,19 @@ def _start_all_eligible_bots():
                     continue
 
         try:
+            m = ProcessMonitor(user_id, path)
             with monitors_lock:
-                m = monitors.get(user_id)
-                if m is None:
-                    m = ProcessMonitor(user_id, path)
-                    monitors[user_id] = m
+                monitors[user_id] = m
             m.last_restart_reason = 'REBUILD_RESTART'
             if m.start_process():
-                launched.append((user_id, m))
+                success += 1
             else:
                 fail += 1
-            time.sleep(1.5)   # একসাথে সব bot login/RAM spike না হওয়ার জন্য stagger
         except Exception as e:
             print(f"Start error user {user_id}: {e}")
             fail += 1
 
-    # start_process() শুধু 0.3s দেখে True দেয় — তাই একটু অপেক্ষা করে আসলেই বেঁচে আছে কিনা যাচাই
-    if launched:
-        time.sleep(8)
-        for uid_, m_ in launched:
-            try:
-                if m_.process is not None and m_.process.poll() is None:
-                    success += 1
-                else:
-                    fail += 1
-                    print(f"❌ user={uid_} bot started but DIED within 8s (log-এ exit code দেখুন)")
-            except Exception:
-                fail += 1
-    _REBUILD_UNTIL = 0
-    print(f"🚀 Start summary: alive={success}, died/failed={fail}, skipped={skipped}")
+    print(f"🚀 Start summary: success={success}, failed={fail}, skipped={skipped}")
     return success, fail, skipped
 
 
@@ -3113,43 +3023,6 @@ window.mahirSpeak = function(text, lang){
   }catch(e){}
 };
 try{ if(window.speechSynthesis){ window.speechSynthesis.getVoices(); window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();}; } }catch(e){}
-
-/* ===== Voice ON/OFF — প্রতিটি মানুষ নিজের browser-এ (User / Admin / Owner panel) ===== */
-(function(){
-  var KEY = 'mahir_voice_enabled';
-  function isOn(){ try{ return localStorage.getItem(KEY) !== '0'; }catch(e){ return true; } }
-  function setOn(v){ try{ localStorage.setItem(KEY, v ? '1' : '0'); }catch(e){} }
-  try{
-    var P = window.SpeechSynthesis && window.SpeechSynthesis.prototype;
-    if(P && !P.__mahirPatched){
-      var orig = P.speak;
-      P.speak = function(u){ if(!isOn()) return; return orig.call(this, u); };
-      P.__mahirPatched = true;
-    }
-  }catch(e){}
-  window.mahirVoiceEnabled = isOn;
-  function paint(btn){
-    var on = isOn();
-    btn.innerHTML = on ? '🔊 Voice ON' : '🔇 Voice OFF';
-    btn.style.opacity = on ? '1' : '0.75';
-    btn.title = on ? 'Voice বন্ধ করুন' : 'Voice চালু করুন';
-  }
-  function mount(){
-    if(document.getElementById('mahirVoiceToggle')) return;
-    var b = document.createElement('button');
-    b.id = 'mahirVoiceToggle'; b.type = 'button';
-    b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:99999;padding:8px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.25);background:rgba(20,20,28,.92);color:#fff;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4);';
-    paint(b);
-    b.addEventListener('click', function(){
-      var next = !isOn();
-      if(!next){ try{ window.speechSynthesis.cancel(); }catch(e){} }
-      setOn(next); paint(b);
-      if(next && window.mahirSpeak) window.mahirSpeak('ভয়েস চালু হয়েছে');
-    });
-    document.body.appendChild(b);
-  }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
-})();
 
 /* Auto voice for file uploads + flash messages */
 (function(){
@@ -8227,7 +8100,7 @@ def owner_reset_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
     success, fail = reset_all_bots()
-    flash(f'🔄 Reset complete: {success} bots running (verified after 8s), {fail} died/failed — failed bot-এর log দেখুন। All bot files rebuilt from mahir.py + DB creds, expired files deleted.', 'success')
+    flash(f'🔄 Reset complete: {success} bots started, {fail} failed. All bot files were rebuilt from mahir.py + DB creds, expired files deleted.', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
