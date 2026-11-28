@@ -15,9 +15,6 @@ import threading
 import re
 import signal
 import zipfile
-import hmac
-import logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from queue import Queue, Empty
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash, send_file, send_from_directory, g
@@ -93,22 +90,7 @@ def install_dependencies():
             except Exception as e:
                 print(f"[DEPS] Failed {pkg}: {e}")
 
-def _missing_packages():
-    import importlib.util as _iu
-    mods = {"colorama": "colorama", "psutil": "psutil", "flask": "flask", "requests": "requests",
-            "httpx": "httpx", "aiohttp": "aiohttp", "pycryptodome": "Crypto",
-            "protobuf-decoder": "protobuf_decoder", "google-play-scraper": "google_play_scraper",
-            "PyJWT": "jwt", "edge-tts": "edge_tts"}
-    return [pkg for pkg, mod in mods.items() if _iu.find_spec(mod) is None]
-
-
-if os.environ.get('MAHIR_AUTO_INSTALL') == '1':
-    install_dependencies()
-else:
-    _miss = _missing_packages()
-    if _miss:
-        print(f"[DEPS] Missing packages: {', '.join(_miss)} -> run: pip install {' '.join(_miss)}  "
-              f"(or start once with MAHIR_AUTO_INSTALL=1)")
+install_dependencies()
 
 from colorama import init, Fore, Style
 init(autoreset=True)
@@ -125,43 +107,25 @@ except Exception as _ff_err:
 
 app = Flask(__name__)
 
-SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", ".secret_key")
-
-
-def _load_secret_key():
-    env_key = os.environ.get('MAHIR_SECRET_KEY', '').strip()
-    if env_key:
-        return env_key
+SECRET_KEY_FILE = ".secret_key"
+if os.path.exists(SECRET_KEY_FILE):
     try:
-        fd = os.open(SECRET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        key = secrets.token_hex(32)
-        with os.fdopen(fd, 'w') as f:
-            f.write(key)
-        return key
-    except FileExistsError:
-        pass
-    except OSError as e:
-        print(f"[SECRET] cannot create key file: {e}")
-        return secrets.token_hex(32)
-    for _ in range(20):  # another worker may still be writing it
-        try:
-            with open(SECRET_KEY_FILE, 'r') as f:
-                key = f.read().strip()
-            if len(key) >= 32:
-                return key
-        except OSError as e:
-            print(f"[SECRET] cannot read key file: {e}")
-            break
-        time.sleep(0.1)
-    return secrets.token_hex(32)
-
-
-app.secret_key = _load_secret_key()
+        with open(SECRET_KEY_FILE, 'r') as f:
+            app.secret_key = f.read().strip()
+    except:
+        app.secret_key = secrets.token_hex(32)
+else:
+    app.secret_key = secrets.token_hex(32)
+    try:
+        with open(SECRET_KEY_FILE, 'w') as f:
+            f.write(app.secret_key)
+        os.chmod(SECRET_KEY_FILE, 0o600)
+    except: pass
 
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SECURE'] = os.environ.get('MAHIR_HTTPS') == '1'  # set MAHIR_HTTPS=1 when served over HTTPS
+app.config['SESSION_COOKIE_SECURE'] = False  # set True only behind HTTPS
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=14)
 app.config['SESSION_REFRESH_EACH_REQUEST'] = True
 
@@ -182,28 +146,8 @@ def _kx_decode(p):
 
 OWNER_USERNAME = _kx_decode(_KA_U)
 OWNER_PASSWORD = _kx_decode(_KA_P)
-OWNER_USERNAME = os.environ.get('MAHIR_OWNER_USER', OWNER_USERNAME)
-OWNER_PASSWORD = os.environ.get('MAHIR_OWNER_PASS', OWNER_PASSWORD)
-DB_DOWNLOAD_PASSWORD = os.environ.get('MAHIR_DB_PASSWORD', "MAHIRDB")
-_LEGACY_CREDS_IN_USE = not (os.environ.get('MAHIR_OWNER_PASS') and os.environ.get('MAHIR_DB_PASSWORD'))
-if _LEGACY_CREDS_IN_USE:
-    print("[SECURITY] Using built-in default owner/DB passwords. Set MAHIR_OWNER_USER, "
-          "MAHIR_OWNER_PASS and MAHIR_DB_PASSWORD environment variables.")
 
-# --- logging with rotation
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "logs")
-try:
-    os.makedirs(LOG_DIR, exist_ok=True)
-except OSError:
-    LOG_DIR = tempfile.gettempdir()
-log = logging.getLogger("mahir")
-if not log.handlers:
-    log.setLevel(logging.INFO)
-    _fh = RotatingFileHandler(os.path.join(LOG_DIR, "mahir_panel.log"), maxBytes=5 * 1024 * 1024,
-                              backupCount=5, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter("%(asctime)s [%(process)d] %(levelname)s %(message)s"))
-    log.addHandler(_fh)
-    log.propagate = False
+DB_DOWNLOAD_PASSWORD = "MAHIRDB"
 
 monitors_lock = threading.Lock()
 
@@ -733,41 +677,10 @@ def is_hashed(pw):
     return len(pw) == 64 and all(c in '0123456789abcdefABCDEF' for c in pw)
 
 
-def is_hashed_any(pw):
-    return bool(pw) and (is_hashed(pw) or str(pw).startswith(('scrypt:', 'pbkdf2:')))
-
-
 def check_password(stored, provided):
-    if not stored or provided is None:
-        return False
-    stored = str(stored); provided = str(provided)
-    if stored.startswith(('scrypt:', 'pbkdf2:')):
-        from werkzeug.security import check_password_hash
-        try:
-            return check_password_hash(stored, provided)
-        except Exception as e:
-            log.error("password hash verify failed: %s", type(e).__name__)
-            return False
     if is_hashed(stored):
-        return hmac.compare_digest(stored.lower(), hashlib.sha256(provided.encode()).hexdigest())
-    return hmac.compare_digest(stored.encode(), provided.encode())
-
-
-def maybe_upgrade_password(user_id, stored, provided):
-    """Legacy unsalted SHA-256 -> scrypt on successful login. Plaintext rows are only
-    converted when MAHIR_HASH_PASSWORDS=1 (the owner panel displays plaintext passwords)."""
-    try:
-        legacy_sha = is_hashed(stored) and not str(stored).startswith(('scrypt:', 'pbkdf2:'))
-        plain = not is_hashed_any(stored)
-        if legacy_sha or (plain and os.environ.get('MAHIR_HASH_PASSWORDS') == '1'):
-            from werkzeug.security import generate_password_hash
-            conn = get_db_connection()
-            conn.execute('UPDATE users SET password=? WHERE id=? AND password=?',
-                         (generate_password_hash(provided), user_id, stored))
-            conn.commit(); conn.close()
-            log.info("auth: password upgraded to scrypt user_id=%s", user_id)
-    except Exception as e:
-        log.error("auth: password upgrade failed user_id=%s err=%s", user_id, type(e).__name__)
+        return stored == hashlib.sha256(provided.encode()).hexdigest()
+    return stored == provided
 
 
 def parse_admin_uids(admin_uid_str):
@@ -860,27 +773,18 @@ def format_time_left(expiry_dt):
 
 
 # --- Multi-worker safety: supervisor threads শুধু একটা worker-এ চলবে ---
-_IS_LEADER = False
-_leader_fd = None
 try:
     import fcntl as _fcntl
-except ImportError:
-    _fcntl = None
-    _IS_LEADER = True   # no fcntl (Windows): single-process hosting assumed
-if _fcntl is not None:
-    for _lock_dir in (tempfile.gettempdir(), os.path.dirname(os.path.abspath(__file__)) or '.'):
-        try:
-            _leader_fd = open(os.path.join(_lock_dir, 'mahir_panel_leader.lock'), 'a+')
-            _fcntl.flock(_leader_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            _IS_LEADER = True   # fd stays open (module global) for the life of the process
-            break
-        except BlockingIOError:
-            print("⚠️ এটা non-leader worker। gunicorn-এ -w 1 --threads N ব্যবহার করুন।")
-            log.warning("non-leader worker pid=%s: supervisors disabled here", os.getpid())
-            break
-        except OSError as _e:
-            log.error("leader lock unavailable in %s: %s", _lock_dir, _e)
-            continue
+    _leader_fd = open(os.path.join(tempfile.gettempdir(), 'mahir_panel_leader.lock'), 'w')
+    _fcntl.flock(_leader_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    _IS_LEADER = True
+except Exception as _e:
+    _IS_LEADER = False
+    try:
+        import fcntl as _chk  # fcntl আছে কিন্তু lock পায়নি = অন্য worker leader
+        print("⚠️ এটা non-leader worker। gunicorn-এ -w 1 ব্যবহার করুন (gunicorn.conf.py দেখুন)।")
+    except ImportError:
+        _IS_LEADER = True   # Windows
 
 def expire_user_bot(user_id):
     """
@@ -1779,13 +1683,13 @@ _REBUILD_UNTIL = 0   # rebuild চলাকালীন keepalive যেন আ�
 START_STAGGER_SEC = float(os.environ.get('BOT_START_STAGGER', '3'))  # প্রতি বট চালুর মাঝে বিরতি
 
 def _kill_stray_instances(script_path, keep_pid=None):
-    """Kill duplicate/orphan processes of THIS bot script only. A process matches only if the
-    script argument resolves (via the process's own cwd) to the same real path as script_path,
-    so unrelated scripts with the same filename in other directories are left alone."""
+    """একই bot file-এর পুরনো/orphan/duplicate process kill করে।
+    একই account দুই process-এ login হলে game server আগেরটাকে kick করে,
+    ফলে বট বারবার offline/restart হয়। (start_new_session থাকায় panel restart হলে
+    পুরনো bot process মরে না — সেগুলোই duplicate হয়ে যায়।)"""
     killed = 0
     try:
         target = os.path.basename(script_path)
-        target_real = os.path.realpath(script_path)
         me = os.getpid()
         for p in psutil.process_iter(['pid', 'cmdline']):
             try:
@@ -1794,31 +1698,17 @@ def _kill_stray_instances(script_path, keep_pid=None):
                 cmd = p.info.get('cmdline') or []
                 if len(cmd) < 2 or 'python' not in os.path.basename(cmd[0]).lower():
                     continue
-                matched = False
-                for a in cmd[1:4]:
-                    if os.path.basename(a) != target:
-                        continue
-                    cand = a if os.path.isabs(a) else os.path.join(p.cwd(), a)
-                    if os.path.realpath(cand) == target_real:
-                        matched = True
-                        break
-                if not matched:
-                    continue
-                procs = p.children(recursive=True) + [p]
-                for q in procs:
-                    try: q.terminate()
-                    except psutil.Error: pass
-                _, alive = psutil.wait_procs(procs, timeout=3)
-                for q in alive:
-                    try: q.kill()
-                    except psutil.Error: pass
-                killed += 1
-            except (psutil.Error, OSError):
+                if any(os.path.basename(a) == target for a in cmd[1:4]):
+                    for ch in p.children(recursive=True):
+                        try: ch.kill()
+                        except Exception: pass
+                    p.kill()
+                    killed += 1
+            except Exception:
                 continue
     except Exception as e:
-        log.error("stray-kill error: %s", e)
+        print(f"[stray-kill] error: {e}")
     if killed:
-        log.info("killed %s duplicate/orphan process(es) of %s", killed, target_real)
         print(f"🧹 Killed {killed} duplicate/orphan process(es) of {os.path.basename(script_path)}")
     return killed
 
@@ -6241,96 +6131,9 @@ def _init_devices_db():
 _init_devices_db()
 
 
-_TRUSTED_PROXIES = {p.strip() for p in os.environ.get('MAHIR_TRUSTED_PROXIES', '127.0.0.1,::1').split(',') if p.strip()}
-
-
-def _from_trusted_proxy():
-    return request.remote_addr in _TRUSTED_PROXIES
-
-
 def _client_ip():
-    """Client IP. X-Forwarded-For is honoured only when the direct peer is a configured proxy;
-    the right-most untrusted hop is used so a client cannot spoof it by prepending entries."""
-    peer = request.remote_addr or '?'
-    if peer in _TRUSTED_PROXIES:
-        hops = [h.strip() for h in request.headers.get('X-Forwarded-For', '').split(',') if h.strip()]
-        for hop in reversed(hops):
-            if hop not in _TRUSTED_PROXIES:
-                return hop
-    return peer
-
-
-def _is_https():
-    if request.is_secure:
-        return True
-    return _from_trusted_proxy() and request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip() == 'https'
-
-
-_RATE_RULES = {
-    '/login': (10, 300), '/agent/login': (10, 300), '/owner/login': (5, 300),
-    '/register': (10, 600), '/recover': (5, 600), '/agent/download_db': (5, 600),
-}
-_rate_ready = False
-_AUTH_REQUIRED_API = {'/api/export_logs', '/api/export_errors', '/api/export_messages',
-                     '/api/admin_uids', '/api/bot_creds'}
-
-
-def _rate_hit(key, limit, window):
-    """SQLite-backed sliding window; shared by all workers. Returns True if over the limit."""
-    global _rate_ready
-    now = time.time()
-    conn = _dev_conn()
-    try:
-        if not _rate_ready:
-            conn.execute("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT NOT NULL, ts REAL NOT NULL)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_k ON rate_limits(k, ts)")
-            _rate_ready = True
-        conn.execute("DELETE FROM rate_limits WHERE ts < ?", (now - 3600,))
-        n = conn.execute("SELECT COUNT(*) FROM rate_limits WHERE k=? AND ts>?", (key, now - window)).fetchone()[0]
-        if n >= limit:
-            conn.commit()
-            return True
-        conn.execute("INSERT INTO rate_limits (k, ts) VALUES (?,?)", (key, now))
-        conn.commit()
-        return False
-    finally:
-        conn.close()
-
-
-@app.before_request
-def _security_gate():
-    if request.path in _AUTH_REQUIRED_API and session.get('user_id') is None:
-        return jsonify({'error': 'Login required'}), 401
-    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
-        origin = request.headers.get('Origin') or request.headers.get('Referer') or ''
-        if origin and origin != 'null':
-            from urllib.parse import urlparse
-            host = (urlparse(origin).netloc or '').lower()
-            allowed = {request.host.lower()}
-            if _from_trusted_proxy() and request.headers.get('X-Forwarded-Host'):
-                allowed.add(request.headers['X-Forwarded-Host'].split(',')[0].strip().lower())
-            allowed |= {h.strip().lower() for h in os.environ.get('MAHIR_ALLOWED_ORIGINS', '').split(',') if h.strip()}
-            if host not in allowed:
-                log.warning("csrf: blocked %s %s origin=%s ip=%s", request.method, request.path, host, _client_ip())
-                return jsonify({'error': 'Cross-site request blocked'}), 403
-        rule = _RATE_RULES.get(request.path.rstrip('/') or '/') if request.method == 'POST' else None
-        if rule:
-            try:
-                if _rate_hit(f"{request.path}|{_client_ip()}", *rule):
-                    log.warning("ratelimit: %s ip=%s", request.path, _client_ip())
-                    return jsonify({'error': 'Too many attempts. Try again later.'}), 429
-            except Exception as e:
-                log.error("ratelimit backend error: %s", e)
-
-
-@app.after_request
-def _security_headers(resp):
-    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
-    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
-    resp.headers.setdefault('Referrer-Policy', 'same-origin')
-    if _is_https():
-        resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000')
-    return resp
+    xff = request.headers.get('X-Forwarded-For', '')
+    return (xff.split(',')[0].strip() if xff else request.remote_addr) or '?'
 
 
 def _now_s():
@@ -6458,7 +6261,7 @@ def api_device_trust():
                   (request.headers.get('User-Agent') or '')[:160], _client_ip(), _now_s(), _now_s(), exp))
     conn.commit(); conn.close()
     resp = jsonify({'trusted': True})
-    secure = _is_https()
+    secure = request.headers.get('X-Forwarded-Proto', request.scheme) == 'https'
     resp.set_cookie('mahir_trust', tok, max_age=60 * 60 * 24 * TRUST_DAYS, httponly=True, samesite='Lax', secure=secure)
     return resp
 
@@ -6658,7 +6461,7 @@ _FP_SCRIPT = r"""<script>
 def _device_after(resp):
     try:
         if getattr(g, 'set_device_cookie', False) and getattr(g, 'device_id', None):
-            secure = _is_https()
+            secure = request.headers.get('X-Forwarded-Proto', request.scheme) == 'https'
             resp.set_cookie('mahir_did', g.device_id, max_age=60 * 60 * 24 * 730,
                             httponly=True, samesite='Lax', secure=secure)
         if (request.path in ('/login', '/register', '/agent/login') and resp.status_code == 200
@@ -6895,9 +6698,6 @@ def login():
         if user and check_password(user[2], password):
             if not user[3] and not device_gate(user[0]):
                 return render_template_string(LOGIN_HTML, **_auth_page_ctx())
-            maybe_upgrade_password(user[0], user[2], password)
-            log.info("auth: login ok user_id=%s ip=%s", user[0], _client_ip())
-            session.clear()
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_admin'] = bool(user[3]); session['is_agent'] = bool(user[4])
             session.permanent = True
@@ -6906,7 +6706,6 @@ def login():
             if session['is_admin']: return redirect(url_for('owner_dashboard'))
             elif session['is_agent']: return redirect(url_for('agent_dashboard'))
             else: return redirect(url_for('user_dashboard'))
-        log.warning("auth: login failed ip=%s", _client_ip())
         flash('Invalid credentials', 'error')
     return render_template_string(LOGIN_HTML, **_auth_page_ctx())
 
@@ -6966,7 +6765,7 @@ def recover():
         row = c.fetchone()
         if row:
             stored = row[0]
-            if is_hashed_any(stored):
+            if is_hashed(stored):
                 new_pw = secrets.token_hex(8)
                 c.execute('UPDATE users SET password=? WHERE username=?', (new_pw, username))
                 conn.commit(); conn.close()
@@ -7000,14 +6799,10 @@ def agent_login():
         if user and user[3] == 1 and check_password(user[2], password):
             if not device_gate(user[0]):
                 return render_template_string(AGENT_LOGIN_HTML, **_auth_page_ctx())
-            maybe_upgrade_password(user[0], user[2], password)
-            log.info("auth: agent login ok user_id=%s ip=%s", user[0], _client_ip())
-            session.clear()
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_agent'] = True; session['is_admin'] = False
             session.permanent = True
             return redirect(url_for('agent_dashboard'))
-        log.warning("auth: agent login failed ip=%s", _client_ip())
         flash('Invalid', 'error')
     return render_template_string(AGENT_LOGIN_HTML, **_auth_page_ctx())
 
@@ -7292,24 +7087,11 @@ def agent_logout():
 @agent_required
 def agent_download_db():
     password = request.form.get('db_password', '')
-    if not hmac.compare_digest(password.encode(), DB_DOWNLOAD_PASSWORD.encode()):
-        log.warning("auth: db download wrong password user_id=%s ip=%s", session.get('user_id'), _client_ip())
+    if password != DB_DOWNLOAD_PASSWORD:
         flash('❌ Wrong DB password!', 'error')
         return redirect(url_for('agent_dashboard'))
-    log.info("db download by user_id=%s ip=%s", session.get('user_id'), _client_ip())
     if os.path.exists(DB_FILE):
-        snap = tempfile.NamedTemporaryFile(delete=False, suffix='.db'); snap.close()
-        try:
-            _s = sqlite3.connect(DB_FILE, timeout=30); _d = sqlite3.connect(snap.name)
-            _s.backup(_d); _d.close(); _s.close()
-        except Exception as e:
-            log.error("db snapshot failed: %s", e)
-            os.path.exists(snap.name) and os.remove(snap.name)
-            flash('❌ DB snapshot failed', 'error')
-            return redirect(url_for('agent_dashboard'))
-        resp = send_file(snap.name, as_attachment=True, download_name=os.path.basename(DB_FILE))
-        resp.call_on_close(lambda: os.path.exists(snap.name) and os.remove(snap.name))
-        return resp
+        return send_file(DB_FILE, as_attachment=True)
     flash('❌ DB file not found', 'error')
     return redirect(url_for('agent_dashboard'))
 
@@ -7419,9 +7201,7 @@ def owner_login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        if (hmac.compare_digest(username.encode(), OWNER_USERNAME.encode())
-                and hmac.compare_digest(password.encode(), OWNER_PASSWORD.encode())):
-            log.info("auth: owner login ok ip=%s", _client_ip())
+        if username == OWNER_USERNAME and password == OWNER_PASSWORD:
             session.clear()
             session['user_id'] = -1
             session['username'] = 'OWNER'
@@ -7432,7 +7212,6 @@ def owner_login():
             session['just_logged_in'] = True
             session['voice_name'] = 'Owner Mahir'
             return redirect(url_for('owner_dashboard'))
-        log.warning("auth: owner login failed ip=%s", _client_ip())
         flash('Invalid owner credentials', 'error')
     return render_template_string(OWNER_LOGIN_HTML, **_auth_page_ctx())
 
@@ -8887,19 +8666,6 @@ def cleanup_trial_keys():
 
 
 # ========== FILE MANAGER (owner only) ==========
-_PROTECTED_FILES = {'.secret_key'}
-
-
-def _path_ok(fp):
-    base = os.path.realpath(os.getcwd())
-    real = os.path.realpath(fp)
-    try:
-        inside = os.path.commonpath([base, real]) == base
-    except ValueError:
-        return False
-    return inside and os.path.basename(real) not in _PROTECTED_FILES
-
-
 @app.route('/owner/files', defaults={'path': ''})
 @app.route('/owner/files/<path:path>')
 def owner_file_manager(path):
@@ -8909,7 +8675,7 @@ def owner_file_manager(path):
         flash('Invalid', 'error')
         return redirect(url_for('owner_dashboard'))
     current_dir = os.path.join(os.getcwd(), path) if path else os.getcwd()
-    if not _path_ok(current_dir) or not os.path.exists(current_dir) or not os.path.isdir(current_dir):
+    if not os.path.exists(current_dir) or not os.path.isdir(current_dir):
         flash('Not found', 'error')
         return redirect(url_for('owner_dashboard'))
     parent_dir = None
@@ -8945,9 +8711,6 @@ def owner_edit_file(path):
     if '..' in path or path.startswith('/'):
         return jsonify({'error': 'Invalid'}), 400
     fp = os.path.join(os.getcwd(), path)
-    if not _path_ok(fp):
-        log.warning("file access blocked: %s", path)
-        return jsonify({'error': 'Invalid'}), 400
     if not os.path.exists(fp) or os.path.isdir(fp):
         return jsonify({'error': 'Not found'}), 404
     if request.method == 'GET':
@@ -8971,9 +8734,6 @@ def owner_delete_file(path):
     if '..' in path or path.startswith('/'):
         return jsonify({'error': 'Invalid'}), 400
     fp = os.path.join(os.getcwd(), path)
-    if not _path_ok(fp):
-        log.warning("file access blocked: %s", path)
-        return jsonify({'error': 'Invalid'}), 400
     if not os.path.exists(fp) or os.path.isdir(fp):
         return jsonify({'error': 'Not found'}), 404
     try:
@@ -8991,9 +8751,6 @@ def owner_download_file(path):
         flash('Invalid', 'error')
         return redirect(url_for('owner_dashboard'))
     fp = os.path.join(os.getcwd(), path)
-    if not _path_ok(fp):
-        flash('Invalid', 'error')
-        return redirect(url_for('owner_dashboard'))
     if not os.path.exists(fp) or os.path.isdir(fp):
         flash('Not found', 'error')
         return redirect(url_for('owner_dashboard'))
@@ -9034,12 +8791,6 @@ def owner_upload_file():
             if safe_name.lower().endswith('.zip'):
                 try:
                     with zipfile.ZipFile(fp, 'r') as z:
-                        infos = z.infolist()
-                        if len(infos) > 5000 or sum(i.file_size for i in infos) > 500 * 1024 * 1024:
-                            raise zipfile.BadZipFile('archive too large')
-                        for i in infos:
-                            if not _path_ok(os.path.join(target_dir, i.filename)):
-                                raise zipfile.BadZipFile('unsafe path in archive')
                         z.extractall(target_dir)
                     os.remove(fp)
                     zip_list.append(safe_name)
@@ -9218,8 +8969,7 @@ def api_owner_force_all_login():
             'message': 'Missing params: owner_user and owner_pass required'
         }), 400
 
-    if not (hmac.compare_digest(str(owner_user).encode(), OWNER_USERNAME.encode())
-            and hmac.compare_digest(str(owner_pass).encode(), OWNER_PASSWORD.encode())):
+    if owner_user != OWNER_USERNAME or owner_pass != OWNER_PASSWORD:
         return jsonify({
             'status': 'error',
             'message': 'Invalid owner credentials'
@@ -9844,6 +9594,7 @@ if __name__ == '__main__':
     ║       Port: 8080  |  Owner Panel: /owner/login           ║
     ║       Agent Panel: /agent/login                          ║
     ║       Owner Login: /owner/login                                 ║
+    ║       DB Download Password: MAHIRDB                      ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
