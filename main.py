@@ -6,6 +6,7 @@ import sys
 import sqlite3
 import hashlib
 import secrets
+import tempfile
 import json
 import time
 import subprocess
@@ -14,9 +15,12 @@ import threading
 import re
 import signal
 import zipfile
+import hmac
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from queue import Queue, Empty
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash, send_file, send_from_directory
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash, send_file, send_from_directory, g
 from functools import wraps
 import psutil
 import requests
@@ -89,7 +93,22 @@ def install_dependencies():
             except Exception as e:
                 print(f"[DEPS] Failed {pkg}: {e}")
 
-install_dependencies()
+def _missing_packages():
+    import importlib.util as _iu
+    mods = {"colorama": "colorama", "psutil": "psutil", "flask": "flask", "requests": "requests",
+            "httpx": "httpx", "aiohttp": "aiohttp", "pycryptodome": "Crypto",
+            "protobuf-decoder": "protobuf_decoder", "google-play-scraper": "google_play_scraper",
+            "PyJWT": "jwt", "edge-tts": "edge_tts"}
+    return [pkg for pkg, mod in mods.items() if _iu.find_spec(mod) is None]
+
+
+if os.environ.get('MAHIR_AUTO_INSTALL') == '1':
+    install_dependencies()
+else:
+    _miss = _missing_packages()
+    if _miss:
+        print(f"[DEPS] Missing packages: {', '.join(_miss)} -> run: pip install {' '.join(_miss)}  "
+              f"(or start once with MAHIR_AUTO_INSTALL=1)")
 
 from colorama import init, Fore, Style
 init(autoreset=True)
@@ -106,25 +125,43 @@ except Exception as _ff_err:
 
 app = Flask(__name__)
 
-SECRET_KEY_FILE = ".secret_key"
-if os.path.exists(SECRET_KEY_FILE):
+SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", ".secret_key")
+
+
+def _load_secret_key():
+    env_key = os.environ.get('MAHIR_SECRET_KEY', '').strip()
+    if env_key:
+        return env_key
     try:
-        with open(SECRET_KEY_FILE, 'r') as f:
-            app.secret_key = f.read().strip()
-    except:
-        app.secret_key = secrets.token_hex(32)
-else:
-    app.secret_key = secrets.token_hex(32)
-    try:
-        with open(SECRET_KEY_FILE, 'w') as f:
-            f.write(app.secret_key)
-        os.chmod(SECRET_KEY_FILE, 0o600)
-    except: pass
+        fd = os.open(SECRET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        key = secrets.token_hex(32)
+        with os.fdopen(fd, 'w') as f:
+            f.write(key)
+        return key
+    except FileExistsError:
+        pass
+    except OSError as e:
+        print(f"[SECRET] cannot create key file: {e}")
+        return secrets.token_hex(32)
+    for _ in range(20):  # another worker may still be writing it
+        try:
+            with open(SECRET_KEY_FILE, 'r') as f:
+                key = f.read().strip()
+            if len(key) >= 32:
+                return key
+        except OSError as e:
+            print(f"[SECRET] cannot read key file: {e}")
+            break
+        time.sleep(0.1)
+    return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
 
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SECURE'] = False  # set True only behind HTTPS
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('MAHIR_HTTPS') == '1'  # set MAHIR_HTTPS=1 when served over HTTPS
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=14)
 app.config['SESSION_REFRESH_EACH_REQUEST'] = True
 
@@ -145,8 +182,28 @@ def _kx_decode(p):
 
 OWNER_USERNAME = _kx_decode(_KA_U)
 OWNER_PASSWORD = _kx_decode(_KA_P)
+OWNER_USERNAME = os.environ.get('MAHIR_OWNER_USER', OWNER_USERNAME)
+OWNER_PASSWORD = os.environ.get('MAHIR_OWNER_PASS', OWNER_PASSWORD)
+DB_DOWNLOAD_PASSWORD = os.environ.get('MAHIR_DB_PASSWORD', "MAHIRDB")
+_LEGACY_CREDS_IN_USE = not (os.environ.get('MAHIR_OWNER_PASS') and os.environ.get('MAHIR_DB_PASSWORD'))
+if _LEGACY_CREDS_IN_USE:
+    print("[SECURITY] Using built-in default owner/DB passwords. Set MAHIR_OWNER_USER, "
+          "MAHIR_OWNER_PASS and MAHIR_DB_PASSWORD environment variables.")
 
-DB_DOWNLOAD_PASSWORD = "MAHIRDB"
+# --- logging with rotation
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "logs")
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except OSError:
+    LOG_DIR = tempfile.gettempdir()
+log = logging.getLogger("mahir")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _fh = RotatingFileHandler(os.path.join(LOG_DIR, "mahir_panel.log"), maxBytes=5 * 1024 * 1024,
+                              backupCount=5, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(process)d] %(levelname)s %(message)s"))
+    log.addHandler(_fh)
+    log.propagate = False
 
 monitors_lock = threading.Lock()
 
@@ -676,10 +733,41 @@ def is_hashed(pw):
     return len(pw) == 64 and all(c in '0123456789abcdefABCDEF' for c in pw)
 
 
+def is_hashed_any(pw):
+    return bool(pw) and (is_hashed(pw) or str(pw).startswith(('scrypt:', 'pbkdf2:')))
+
+
 def check_password(stored, provided):
+    if not stored or provided is None:
+        return False
+    stored = str(stored); provided = str(provided)
+    if stored.startswith(('scrypt:', 'pbkdf2:')):
+        from werkzeug.security import check_password_hash
+        try:
+            return check_password_hash(stored, provided)
+        except Exception as e:
+            log.error("password hash verify failed: %s", type(e).__name__)
+            return False
     if is_hashed(stored):
-        return stored == hashlib.sha256(provided.encode()).hexdigest()
-    return stored == provided
+        return hmac.compare_digest(stored.lower(), hashlib.sha256(provided.encode()).hexdigest())
+    return hmac.compare_digest(stored.encode(), provided.encode())
+
+
+def maybe_upgrade_password(user_id, stored, provided):
+    """Legacy unsalted SHA-256 -> scrypt on successful login. Plaintext rows are only
+    converted when MAHIR_HASH_PASSWORDS=1 (the owner panel displays plaintext passwords)."""
+    try:
+        legacy_sha = is_hashed(stored) and not str(stored).startswith(('scrypt:', 'pbkdf2:'))
+        plain = not is_hashed_any(stored)
+        if legacy_sha or (plain and os.environ.get('MAHIR_HASH_PASSWORDS') == '1'):
+            from werkzeug.security import generate_password_hash
+            conn = get_db_connection()
+            conn.execute('UPDATE users SET password=? WHERE id=? AND password=?',
+                         (generate_password_hash(provided), user_id, stored))
+            conn.commit(); conn.close()
+            log.info("auth: password upgraded to scrypt user_id=%s", user_id)
+    except Exception as e:
+        log.error("auth: password upgrade failed user_id=%s err=%s", user_id, type(e).__name__)
 
 
 def parse_admin_uids(admin_uid_str):
@@ -770,6 +858,29 @@ def format_time_left(expiry_dt):
     if minutes > 0 and days < 7: parts.append(f"{minutes}m")
     return ' '.join(parts) if parts else 'Less than 1m'
 
+
+# --- Multi-worker safety: supervisor threads শুধু একটা worker-এ চলবে ---
+_IS_LEADER = False
+_leader_fd = None
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+    _IS_LEADER = True   # no fcntl (Windows): single-process hosting assumed
+if _fcntl is not None:
+    for _lock_dir in (tempfile.gettempdir(), os.path.dirname(os.path.abspath(__file__)) or '.'):
+        try:
+            _leader_fd = open(os.path.join(_lock_dir, 'mahir_panel_leader.lock'), 'a+')
+            _fcntl.flock(_leader_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            _IS_LEADER = True   # fd stays open (module global) for the life of the process
+            break
+        except BlockingIOError:
+            print("⚠️ এটা non-leader worker। gunicorn-এ -w 1 --threads N ব্যবহার করুন।")
+            log.warning("non-leader worker pid=%s: supervisors disabled here", os.getpid())
+            break
+        except OSError as _e:
+            log.error("leader lock unavailable in %s: %s", _lock_dir, _e)
+            continue
 
 def expire_user_bot(user_id):
     """
@@ -867,7 +978,8 @@ def check_all_expired_bots():
         time.sleep(15)
 
 
-threading.Thread(target=check_all_expired_bots, daemon=True).start()
+if _IS_LEADER:
+    threading.Thread(target=check_all_expired_bots, daemon=True).start()
 
 
 def global_bot_keepalive():
@@ -883,6 +995,9 @@ def global_bot_keepalive():
         try:
             if get_global_stop():
                 time.sleep(8)
+                continue
+            if time.time() < _REBUILD_UNTIL:
+                time.sleep(2)
                 continue
             conn = get_db_connection()
             c = conn.cursor()
@@ -930,7 +1045,8 @@ def global_bot_keepalive():
         time.sleep(8)
 
 
-threading.Thread(target=global_bot_keepalive, daemon=True).start()
+if _IS_LEADER:
+    threading.Thread(target=global_bot_keepalive, daemon=True).start()
 
 
 def update_bot_bio(uid, password, username=None, bio_text=None):
@@ -1372,6 +1488,7 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
+            _kill_stray_instances(self.process_name)
 
             try:
                 env_copy = os.environ.copy()
@@ -1405,9 +1522,10 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
+                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(self.process.stdout.readline, ''):
+                        for line in iter(_proc.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1417,6 +1535,8 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
+                    finally:
+                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1434,6 +1554,29 @@ class ProcessMonitor:
                 self.output_lines.append(f"Error: {str(e)}")
                 self.is_running = False
                 return False
+
+    def _log_exit(self, proc):
+        """Process মরলে exit code + কারণ log-এ দেখায় (আগে silent ছিল)।"""
+        try:
+            try:
+                rc = proc.wait(timeout=5)
+            except Exception:
+                rc = proc.poll()
+            if rc is None or self.desired_state == 'stopped':
+                return
+            hints = {
+                -9: 'SIGKILL — সম্ভবত RAM শেষ (OOM) বা কেউ kill করেছে',
+                -15: 'SIGTERM — panel/অন্য process বন্ধ করেছে',
+                -11: 'Segmentation fault — native library crash',
+                0: 'normal exit (script নিজে শেষ হয়েছে)',
+                1: 'error exit — উপরের log দেখুন',
+            }
+            ram = psutil.virtual_memory().percent
+            msg = f"⚠️ BOT PROCESS EXITED code={rc} → {hints.get(rc, 'unexpected exit')} | server RAM {ram}%"
+            self.output_queue.put(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            print(f"user={self.user_id} {msg}")
+        except Exception:
+            pass
 
     def _stop_process_internal(self):
         if self.process:
@@ -1570,6 +1713,7 @@ class ProcessMonitor:
             if not os.path.exists(self.process_name):
                 print(f"Error: {self.process_name} not found")
                 return False
+            _kill_stray_instances(self.process_name)
             try:
                 env_copy = os.environ.copy()
                 env_copy['TERM'] = 'xterm'
@@ -1600,9 +1744,10 @@ class ProcessMonitor:
                     conn.commit(); conn.close()
                 except: pass
 
+                _proc = self.process
                 def enqueue():
                     try:
-                        for line in iter(self.process.stdout.readline, ''):
+                        for line in iter(_proc.stdout.readline, ''):
                             if line:
                                 ts = datetime.now().strftime('%H:%M:%S')
                                 self.output_queue.put(f"[{ts}] {line.rstrip()}")
@@ -1612,6 +1757,8 @@ class ProcessMonitor:
                                     print(f"[process_line error] {pe}")
                     except Exception as e:
                         print(f"[enqueue error user={self.user_id}] {e}")
+                    finally:
+                        self._log_exit(_proc)
 
                 self.output_thread = threading.Thread(target=enqueue, daemon=True)
                 self.output_thread.start()
@@ -1625,6 +1772,55 @@ class ProcessMonitor:
 #  MONITORS
 # ============================================================
 monitors = {}
+
+
+
+_REBUILD_UNTIL = 0   # rebuild চলাকালীন keepalive যেন আধা-লেখা ফাইল চালু না করে
+START_STAGGER_SEC = float(os.environ.get('BOT_START_STAGGER', '3'))  # প্রতি বট চালুর মাঝে বিরতি
+
+def _kill_stray_instances(script_path, keep_pid=None):
+    """Kill duplicate/orphan processes of THIS bot script only. A process matches only if the
+    script argument resolves (via the process's own cwd) to the same real path as script_path,
+    so unrelated scripts with the same filename in other directories are left alone."""
+    killed = 0
+    try:
+        target = os.path.basename(script_path)
+        target_real = os.path.realpath(script_path)
+        me = os.getpid()
+        for p in psutil.process_iter(['pid', 'cmdline']):
+            try:
+                if p.info['pid'] in (me, keep_pid):
+                    continue
+                cmd = p.info.get('cmdline') or []
+                if len(cmd) < 2 or 'python' not in os.path.basename(cmd[0]).lower():
+                    continue
+                matched = False
+                for a in cmd[1:4]:
+                    if os.path.basename(a) != target:
+                        continue
+                    cand = a if os.path.isabs(a) else os.path.join(p.cwd(), a)
+                    if os.path.realpath(cand) == target_real:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                procs = p.children(recursive=True) + [p]
+                for q in procs:
+                    try: q.terminate()
+                    except psutil.Error: pass
+                _, alive = psutil.wait_procs(procs, timeout=3)
+                for q in alive:
+                    try: q.kill()
+                    except psutil.Error: pass
+                killed += 1
+            except (psutil.Error, OSError):
+                continue
+    except Exception as e:
+        log.error("stray-kill error: %s", e)
+    if killed:
+        log.info("killed %s duplicate/orphan process(es) of %s", killed, target_real)
+        print(f"🧹 Killed {killed} duplicate/orphan process(es) of {os.path.basename(script_path)}")
+    return killed
 
 
 def get_monitor(user_id, create_only=True):
@@ -1725,6 +1921,9 @@ def rebuild_all_bot_files(delete_expired=True):
        - সব monitor stop করে দেওয়া হয়
     Return: dict {updated, deleted_expired, failed, total}
     """
+    global _REBUILD_UNTIL
+    _REBUILD_UNTIL = time.time() + 1800   # keepalive এই সময় অপেক্ষা করবে (job শেষে 0 হয়)
+
     # Stop all monitors first
     with monitors_lock:
         for uid, m in list(monitors.items()):
@@ -1803,6 +2002,7 @@ def rebuild_all_bot_files(delete_expired=True):
                 continue
 
             # -- Non-expired: rebuild fresh --
+            _kill_stray_instances(bot_path)
             shutil.copy2(MAHIR_SOURCE, bot_path)
 
             admin_list = parse_admin_uids(admin_uid)
@@ -1853,9 +2053,11 @@ def _start_all_eligible_bots():
     users = c.fetchall()
     conn.close()
 
+    global _REBUILD_UNTIL
     success = 0
     fail = 0
     skipped = 0
+    launched = []
 
     for user_id, bot_file in users:
         if not bot_file:
@@ -1903,20 +2105,75 @@ def _start_all_eligible_bots():
                     continue
 
         try:
-            m = ProcessMonitor(user_id, path)
             with monitors_lock:
-                monitors[user_id] = m
+                m = monitors.get(user_id)
+                if m is None:
+                    m = ProcessMonitor(user_id, path)
+                    monitors[user_id] = m
             m.last_restart_reason = 'REBUILD_RESTART'
             if m.start_process():
-                success += 1
+                launched.append((user_id, m))
             else:
                 fail += 1
+            time.sleep(START_STAGGER_SEC)   # একসাথে সব bot login/RAM spike না হওয়ার জন্য stagger
         except Exception as e:
             print(f"Start error user {user_id}: {e}")
             fail += 1
 
-    print(f"🚀 Start summary: success={success}, failed={fail}, skipped={skipped}")
+    # start_process() শুধু 0.3s দেখে True দেয় — তাই একটু অপেক্ষা করে আসলেই বেঁচে আছে কিনা যাচাই
+    if launched:
+        time.sleep(8)
+        for uid_, m_ in launched:
+            try:
+                if m_.process is not None and m_.process.poll() is None:
+                    success += 1
+                else:
+                    fail += 1
+                    print(f"❌ user={uid_} bot started but DIED within 8s (log-এ exit code দেখুন)")
+            except Exception:
+                fail += 1
+    _REBUILD_UNTIL = 0
+    print(f"🚀 Start summary: alive={success}, died/failed={fail}, skipped={skipped}")
     return success, fail, skipped
+
+
+
+_RESET_JOB = {'running': False, 'status': 'idle', 'started_at': None}
+_reset_job_lock = threading.Lock()
+
+
+def reset_all_bots_async():
+    """Rebuild + staggered start ব্যাকগ্রাউন্ডে চালায়; web request সাথে সাথে ফেরত আসে
+    (আগে request-এর ভিতরেই সব হতো → gunicorn timeout → server বন্ধ/লোড)।"""
+    with _reset_job_lock:
+        if _RESET_JOB['running']:
+            return False
+        _RESET_JOB.update(running=True, status='rebuilding', started_at=datetime.now().isoformat(timespec='seconds'))
+
+    def _run():
+        global _REBUILD_UNTIL
+        try:
+            r = rebuild_all_bot_files(delete_expired=True)
+            _RESET_JOB['status'] = f"starting bots (rebuilt={r['updated']}, expired_deleted={r['deleted_expired']})"
+            sc, fl, sk = _start_all_eligible_bots()
+            _RESET_JOB['status'] = (f"done: rebuilt={r['updated']}, expired_deleted={r['deleted_expired']}, "
+                                    f"alive={sc}, died/failed={fl}, skipped={sk}")
+        except Exception as e:
+            _RESET_JOB['status'] = f"error: {e}"
+            print(f"[reset job] error: {e}")
+        finally:
+            _REBUILD_UNTIL = 0
+            _RESET_JOB['running'] = False
+
+    threading.Thread(target=_run, daemon=True, name='reset-all-bots').start()
+    return True
+
+
+@app.route('/api/owner/reset_status')
+def api_owner_reset_status():
+    if not session.get('is_admin'):
+        return jsonify({'error': 'Owner only'}), 403
+    return jsonify(_RESET_JOB)
 
 
 def reset_all_bots():
@@ -3023,6 +3280,73 @@ window.mahirSpeak = function(text, lang){
   }catch(e){}
 };
 try{ if(window.speechSynthesis){ window.speechSynthesis.getVoices(); window.speechSynthesis.onvoiceschanged=function(){window.speechSynthesis.getVoices();}; } }catch(e){}
+
+/* ===== Voice ON/OFF (account-এ সেভ থাকে) + Verify this device ===== */
+(function(){
+  function getCookie(n){ var m = document.cookie.match(new RegExp('(?:^|; )' + n + '=([^;]*)')); return m ? decodeURIComponent(m[1]) : null; }
+  function setCookie(n, v){ document.cookie = n + '=' + encodeURIComponent(v) + '; path=/; max-age=63072000; samesite=lax'; }
+  function isOn(){
+    var c = getCookie('mahir_voice');
+    if(c !== null) return c !== '0';
+    try{ return localStorage.getItem('mahir_voice_enabled') !== '0'; }catch(e){ return true; }
+  }
+  function setOn(v){
+    setCookie('mahir_voice', v ? '1' : '0');
+    try{ localStorage.setItem('mahir_voice_enabled', v ? '1' : '0'); }catch(e){}
+    try{ fetch('/api/voice_pref', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: v})}); }catch(e){}
+  }
+  try{
+    var P = window.SpeechSynthesis && window.SpeechSynthesis.prototype;
+    if(P && !P.__mahirPatched){
+      var orig = P.speak;
+      P.speak = function(u){ if(!isOn()) return; return orig.call(this, u); };
+      P.__mahirPatched = true;
+    }
+  }catch(e){}
+  window.mahirVoiceEnabled = isOn;
+  var BTN = 'position:fixed;left:12px;z-index:99999;padding:8px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.25);background:rgba(20,20,28,.92);color:#fff;font:600 13px system-ui,sans-serif;cursor:pointer;text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.4);';
+  function paintV(b){ var on = isOn(); b.innerHTML = on ? '🔊 Voice ON' : '🔇 Voice OFF'; b.style.opacity = on ? '1' : '0.75'; }
+  function mountVoice(){
+    if(document.getElementById('mahirVoiceToggle')) return;
+    var b = document.createElement('button');
+    b.id = 'mahirVoiceToggle'; b.type = 'button'; b.style.cssText = BTN + 'bottom:12px;';
+    paintV(b);
+    b.addEventListener('click', function(){
+      var next = !isOn();
+      if(!next){ try{ window.speechSynthesis.cancel(); }catch(e){} }
+      setOn(next); paintV(b);
+      if(next && window.mahirSpeak) window.mahirSpeak('ভয়েস চালু হয়েছে');
+    });
+    document.body.appendChild(b);
+  }
+  function paintT(b, t){ b.innerHTML = t ? '✅ Device verified' : '🔐 Verify this device'; b.title = t ? 'চাপলে এই device-এর auto login বন্ধ হবে' : 'Verify করলে পরের বার password ছাড়াই auto login হবে'; }
+  function mountTrust(){
+    fetch('/api/device/status').then(function(r){ if(!r.ok) throw 0; return r.json(); }).then(function(d){
+      var b = document.createElement('button');
+      b.type = 'button'; b.style.cssText = BTN + 'bottom:56px;';
+      paintT(b, d.trusted);
+      b.addEventListener('click', function(){
+        var want = !d.trusted;
+        fetch(want ? '/api/device/trust' : '/api/device/untrust', {method:'POST'}).then(function(r){ return r.json(); }).then(function(x){
+          d.trusted = !!x.trusted; paintT(b, d.trusted);
+          if(window.mahirSpeak) window.mahirSpeak(d.trusted ? 'ডিভাইস ভেরিফাই হয়েছে' : 'ডিভাইস ভেরিফিকেশন বন্ধ হয়েছে');
+        });
+      });
+      document.body.appendChild(b);
+    }).catch(function(){});
+  }
+  function mountLink(){
+    var p = location.pathname || '';
+    var href = p.indexOf('/owner') === 0 ? '/owner/devices' : (p.indexOf('/agent') === 0 ? '/agent/devices' : '');
+    if(!href || p.indexOf('/devices') >= 0) return;
+    var a = document.createElement('a'); a.href = href; a.textContent = '🛡 Devices';
+    a.style.cssText = BTN + 'bottom:100px;';
+    document.body.appendChild(a);
+    try{ fetch('/api/devices/pending').then(function(r){return r.json();}).then(function(d){ if(d && d.count > 0) a.textContent = '🛡 Devices (' + d.count + ' pending)'; }); }catch(e){}
+  }
+  function mountAll(){ mountVoice(); mountTrust(); mountLink(); }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountAll); else mountAll();
+})();
 
 /* Auto voice for file uploads + flash messages */
 (function(){
@@ -4490,7 +4814,7 @@ document.addEventListener('DOMContentLoaded', function () {
       window.speechSynthesis.speak(u);
     }catch(e){}
   }
-  function playBeep(){
+  function playBeep(){if(window.mahirVoiceEnabled&&!window.mahirVoiceEnabled())return;
     try{
       var ctx = new (window.AudioContext||window.webkitAudioContext)();
       var o = ctx.createOscillator();
@@ -5776,7 +6100,7 @@ setInterval(updateUI,1500);updateUI();
 // Voice greeting after login
 (function(){
   function speak(text){try{if(!window.speechSynthesis)return;window.speechSynthesis.cancel();var u=new SpeechSynthesisUtterance(text);u.lang='en-US';u.rate=0.95;window.speechSynthesis.speak(u);}catch(e){}}
-  function playBeep(){try{var ctx=new(window.AudioContext||window.webkitAudioContext)();var o=ctx.createOscillator();var g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=880;o.type='sine';g.gain.setValueAtTime(0.08,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.25);o.start();o.stop(ctx.currentTime+0.25);}catch(e){}}
+  function playBeep(){if(window.mahirVoiceEnabled&&!window.mahirVoiceEnabled())return;try{var ctx=new(window.AudioContext||window.webkitAudioContext)();var o=ctx.createOscillator();var g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=880;o.type='sine';g.gain.setValueAtTime(0.08,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.25);o.start();o.stop(ctx.currentTime+0.25);}catch(e){}}
   {% if just_logged_in %}
   setTimeout(function(){playBeep();speak("Welcome {{ voice_name or 'User' }}. Your Mahir bot panel is ready.");},700);
   {% endif %}
@@ -5878,6 +6202,686 @@ def handle_unexpected(e):
     return redirect(url_for('login'))
 
 
+
+# ============================================================
+#  TRUSTED DEVICE (auto-login) + VOICE PREFERENCE
+#  - কেউ আটকায় না: যেকোনো device-এ password দিয়ে login চলবে
+#  - "Verify this device" চাপলে শুধু সেই device পরের বার password ছাড়া auto login হবে
+#  - Voice/welcome on-off account-এ সেভ থাকে, পরের login-এও মানা হয়
+#  - আলাদা DB ফাইল (mahir_devices.db) → users.db আপলোডে মুছে যায় না
+# ============================================================
+import hashlib as _hl
+
+DEVICES_DB = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)) or '.', 'mahir_devices.db')
+TRUST_DAYS = 90
+_LOGIN_PATHS = ('/login', '/agent/login', '/owner/login')
+
+
+def _dev_conn():
+    conn = sqlite3.connect(DEVICES_DB, timeout=30)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=30000')
+    except Exception:
+        pass
+    return conn
+
+
+def _init_devices_db():
+    conn = _dev_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS trusted_devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL, username TEXT, role TEXT,
+        token_hash TEXT UNIQUE NOT NULL,
+        label TEXT, ip TEXT, created_at TEXT, last_used TEXT, expires_at TEXT)""")
+    conn.execute("CREATE TABLE IF NOT EXISTS voice_pref (user_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 1)")
+    conn.commit(); conn.close()
+
+
+_init_devices_db()
+
+
+_TRUSTED_PROXIES = {p.strip() for p in os.environ.get('MAHIR_TRUSTED_PROXIES', '127.0.0.1,::1').split(',') if p.strip()}
+
+
+def _from_trusted_proxy():
+    return request.remote_addr in _TRUSTED_PROXIES
+
+
+def _client_ip():
+    """Client IP. X-Forwarded-For is honoured only when the direct peer is a configured proxy;
+    the right-most untrusted hop is used so a client cannot spoof it by prepending entries."""
+    peer = request.remote_addr or '?'
+    if peer in _TRUSTED_PROXIES:
+        hops = [h.strip() for h in request.headers.get('X-Forwarded-For', '').split(',') if h.strip()]
+        for hop in reversed(hops):
+            if hop not in _TRUSTED_PROXIES:
+                return hop
+    return peer
+
+
+def _is_https():
+    if request.is_secure:
+        return True
+    return _from_trusted_proxy() and request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip() == 'https'
+
+
+_RATE_RULES = {
+    '/login': (10, 300), '/agent/login': (10, 300), '/owner/login': (5, 300),
+    '/register': (10, 600), '/recover': (5, 600), '/agent/download_db': (5, 600),
+}
+_rate_ready = False
+_AUTH_REQUIRED_API = {'/api/export_logs', '/api/export_errors', '/api/export_messages',
+                     '/api/admin_uids', '/api/bot_creds'}
+
+
+def _rate_hit(key, limit, window):
+    """SQLite-backed sliding window; shared by all workers. Returns True if over the limit."""
+    global _rate_ready
+    now = time.time()
+    conn = _dev_conn()
+    try:
+        if not _rate_ready:
+            conn.execute("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT NOT NULL, ts REAL NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_k ON rate_limits(k, ts)")
+            _rate_ready = True
+        conn.execute("DELETE FROM rate_limits WHERE ts < ?", (now - 3600,))
+        n = conn.execute("SELECT COUNT(*) FROM rate_limits WHERE k=? AND ts>?", (key, now - window)).fetchone()[0]
+        if n >= limit:
+            conn.commit()
+            return True
+        conn.execute("INSERT INTO rate_limits (k, ts) VALUES (?,?)", (key, now))
+        conn.commit()
+        return False
+    finally:
+        conn.close()
+
+
+@app.before_request
+def _security_gate():
+    if request.path in _AUTH_REQUIRED_API and session.get('user_id') is None:
+        return jsonify({'error': 'Login required'}), 401
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        origin = request.headers.get('Origin') or request.headers.get('Referer') or ''
+        if origin and origin != 'null':
+            from urllib.parse import urlparse
+            host = (urlparse(origin).netloc or '').lower()
+            allowed = {request.host.lower()}
+            if _from_trusted_proxy() and request.headers.get('X-Forwarded-Host'):
+                allowed.add(request.headers['X-Forwarded-Host'].split(',')[0].strip().lower())
+            allowed |= {h.strip().lower() for h in os.environ.get('MAHIR_ALLOWED_ORIGINS', '').split(',') if h.strip()}
+            if host not in allowed:
+                log.warning("csrf: blocked %s %s origin=%s ip=%s", request.method, request.path, host, _client_ip())
+                return jsonify({'error': 'Cross-site request blocked'}), 403
+        rule = _RATE_RULES.get(request.path.rstrip('/') or '/') if request.method == 'POST' else None
+        if rule:
+            try:
+                if _rate_hit(f"{request.path}|{_client_ip()}", *rule):
+                    log.warning("ratelimit: %s ip=%s", request.path, _client_ip())
+                    return jsonify({'error': 'Too many attempts. Try again later.'}), 429
+            except Exception as e:
+                log.error("ratelimit backend error: %s", e)
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    resp.headers.setdefault('Referrer-Policy', 'same-origin')
+    if _is_https():
+        resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000')
+    return resp
+
+
+def _now_s():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _hash_tok(tok):
+    return _hl.sha256(tok.encode()).hexdigest()
+
+
+def _voice_pref(uid):
+    try:
+        conn = _dev_conn()
+        row = conn.execute('SELECT enabled FROM voice_pref WHERE user_id=?', (uid,)).fetchone()
+        conn.close()
+        return 1 if (row is None or row[0]) else 0
+    except Exception:
+        return 1
+
+
+def _session_role():
+    if session.get('owner_mode') or session.get('user_id') == -1:
+        return 'owner'
+    return 'agent' if session.get('is_agent') else ('admin' if session.get('is_admin') else 'user')
+
+
+@app.before_request
+def _trusted_autologin():
+    """Logout অবস্থায় বিশ্বস্ত device-এর cookie থাকলে password ছাড়াই session চালু।"""
+    if request.endpoint == 'static' or session.get('user_id') is not None:
+        return
+    if request.path.endswith('logout') or request.cookies.get('mahir_noauto'):
+        return
+    tok = request.cookies.get('mahir_trust')
+    if not tok:
+        return
+    try:
+        conn = _dev_conn()
+        row = conn.execute('SELECT id, user_id, role FROM trusted_devices WHERE token_hash=? AND expires_at>?',
+                           (_hash_tok(tok), _now_s())).fetchone()
+        if not row:
+            conn.close()
+            return
+        dev_id, uid, role = row
+        if uid == -1 or role == 'owner':
+            session.clear()
+            session['user_id'] = -1; session['username'] = 'OWNER'
+            session['is_admin'] = True; session['is_agent'] = False
+            session['owner_mode'] = True; session['voice_name'] = 'Owner Mahir'
+        else:
+            mc = get_db_connection()
+            u = mc.execute('SELECT id, username, is_admin, is_agent FROM users WHERE id=?', (uid,)).fetchone()
+            mc.close()
+            if not u:
+                conn.execute('DELETE FROM trusted_devices WHERE id=?', (dev_id,))
+                conn.commit(); conn.close()
+                return
+            if not u[2] and dev_setting('enabled') == '1':
+                _ensure_device_id()
+                if device_status(u[0]) != 'approved':
+                    conn.close()
+                    return
+            session.clear()
+            session['user_id'] = u[0]; session['username'] = u[1]
+            session['is_admin'] = bool(u[2]); session['is_agent'] = bool(u[3])
+            session['voice_name'] = u[1]
+        session.permanent = True
+        session['just_logged_in'] = True
+        conn.execute('UPDATE trusted_devices SET last_used=?, ip=? WHERE id=?', (_now_s(), _client_ip(), dev_id))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[trusted-autologin] {e}")
+
+
+@app.after_request
+def _trust_cookies(resp):
+    try:
+        path = request.path
+        if path.endswith('logout'):
+            # স্পষ্টভাবে logout করলে browser বন্ধ না হওয়া পর্যন্ত auto login হবে না
+            resp.set_cookie('mahir_noauto', '1', httponly=True, samesite='Lax')
+        elif request.method == 'POST' and path in _LOGIN_PATHS and resp.status_code == 302:
+            resp.delete_cookie('mahir_noauto')
+            if session.get('user_id') is not None:
+                resp.set_cookie('mahir_voice', str(_voice_pref(session['user_id'])), max_age=63072000, samesite='Lax')
+        elif session.get('user_id') is not None and request.cookies.get('mahir_voice') is None:
+            resp.set_cookie('mahir_voice', str(_voice_pref(session['user_id'])), max_age=63072000, samesite='Lax')
+    except Exception:
+        pass
+    return resp
+
+
+def _need_login():
+    return session.get('user_id') is None
+
+
+@app.route('/api/device/status')
+def api_device_status():
+    if _need_login():
+        return jsonify({'error': 'login'}), 401
+    trusted = False
+    tok = request.cookies.get('mahir_trust')
+    if tok:
+        conn = _dev_conn()
+        row = conn.execute('SELECT 1 FROM trusted_devices WHERE token_hash=? AND user_id=? AND expires_at>?',
+                           (_hash_tok(tok), session['user_id'], _now_s())).fetchone()
+        conn.close()
+        trusted = bool(row)
+    return jsonify({'trusted': trusted, 'voice': bool(_voice_pref(session['user_id']))})
+
+
+@app.route('/api/device/trust', methods=['POST'])
+def api_device_trust():
+    if _need_login():
+        return jsonify({'error': 'login'}), 401
+    tok = secrets.token_urlsafe(32)
+    exp = (datetime.now() + timedelta(days=TRUST_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = _dev_conn()
+    old = request.cookies.get('mahir_trust')
+    if old:
+        conn.execute('DELETE FROM trusted_devices WHERE token_hash=?', (_hash_tok(old),))
+    conn.execute('INSERT INTO trusted_devices (user_id, username, role, token_hash, label, ip, created_at, last_used, expires_at) '
+                 'VALUES (?,?,?,?,?,?,?,?,?)',
+                 (session['user_id'], session.get('username'), _session_role(), _hash_tok(tok),
+                  (request.headers.get('User-Agent') or '')[:160], _client_ip(), _now_s(), _now_s(), exp))
+    conn.commit(); conn.close()
+    resp = jsonify({'trusted': True})
+    secure = _is_https()
+    resp.set_cookie('mahir_trust', tok, max_age=60 * 60 * 24 * TRUST_DAYS, httponly=True, samesite='Lax', secure=secure)
+    return resp
+
+
+@app.route('/api/device/untrust', methods=['POST'])
+def api_device_untrust():
+    tok = request.cookies.get('mahir_trust')
+    if tok:
+        conn = _dev_conn()
+        conn.execute('DELETE FROM trusted_devices WHERE token_hash=?', (_hash_tok(tok),))
+        conn.commit(); conn.close()
+    resp = jsonify({'trusted': False})
+    resp.delete_cookie('mahir_trust')
+    return resp
+
+
+@app.route('/api/voice_pref', methods=['POST'])
+def api_voice_pref():
+    if _need_login():
+        return jsonify({'error': 'login'}), 401
+    enabled = 1 if (request.get_json(silent=True) or {}).get('enabled', True) else 0
+    conn = _dev_conn()
+    conn.execute('INSERT INTO voice_pref (user_id, enabled) VALUES (?,?) '
+                 'ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled', (session['user_id'], enabled))
+    conn.commit(); conn.close()
+    return jsonify({'enabled': bool(enabled)})
+
+
+def _devices_scope_ids():
+    """None = সবাই (Owner); নাহলে agent-এর নিজের user id-র set।"""
+    if session.get('is_admin'):
+        return None
+    conn = get_db_connection()
+    ids = {r[0] for r in conn.execute(
+        'SELECT id FROM users WHERE created_by_agent=? AND is_admin=0 AND is_agent=0', (session.get('username'),)).fetchall()}
+    conn.close()
+    return ids
+
+
+# ============================================================
+#  DEVICE VERIFICATION (approval layer) — User + Agent; Owner exempt
+#  - Login/Register-এ fingerprint (browser + screen + timezone + canvas)
+#  - প্রথম device auto-trust · নতুন device → Owner approve · limit পার হলে block
+#  - Owner panel: settings + সব device Trust / Block / Delete
+#  - "Verify this device" (উপরের auto-login) আলাদা: approved device-এ চাপলে password লাগে না
+# ============================================================
+_DEV_CACHE = {}
+_DEV_CACHE_TTL = 20
+DEV_DEFAULTS = {'enabled': '1', 'max_devices': '2'}
+
+
+def _init_registry_db():
+    conn = _dev_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        label TEXT, ip TEXT,
+        status TEXT DEFAULT 'pending',
+        first_seen TEXT, last_seen TEXT,
+        fp TEXT, note TEXT,
+        UNIQUE(user_id, device_id))""")
+    conn.execute("CREATE TABLE IF NOT EXISTS dev_settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit(); conn.close()
+
+
+_init_registry_db()
+
+
+def dev_setting(key):
+    try:
+        conn = _dev_conn()
+        row = conn.execute('SELECT value FROM dev_settings WHERE key=?', (key,)).fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return row[0]
+    except Exception:
+        pass
+    return DEV_DEFAULTS.get(key, '')
+
+
+def set_dev_setting(key, value):
+    conn = _dev_conn()
+    conn.execute('INSERT INTO dev_settings (key, value) VALUES (?, ?) '
+                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+    conn.commit(); conn.close()
+
+
+def _ensure_device_id():
+    if getattr(g, 'device_id', None):
+        return
+    cookie = request.cookies.get('mahir_did')
+    g.device_id = cookie or secrets.token_hex(16)
+    g.set_device_cookie = not cookie
+
+
+def _client_fp():
+    fp = request.form.get('fp', '') if request.method == 'POST' else ''
+    fp = fp or request.cookies.get('mahir_fp', '')
+    return re.sub(r'[^0-9a-zA-Z]', '', fp)[:64]
+
+
+def device_state(user_id):
+    """(status, note): approved | pending | blocked. নতুন device হলে registry-তে যোগ করে।"""
+    _ensure_device_id()
+    did = g.device_id
+    key = (user_id, did)
+    hit = _DEV_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[1] < _DEV_CACHE_TTL:
+        return hit[0], ''
+    fp = _client_fp()
+    ts = _now_s()
+    enabled = dev_setting('enabled') == '1'
+    try:
+        max_dev = max(1, int(dev_setting('max_devices') or 2))
+    except ValueError:
+        max_dev = 2
+    conn = _dev_conn()
+    note = ''
+    try:
+        row = conn.execute('SELECT id, status, note FROM user_devices WHERE user_id=? AND device_id=?', (user_id, did)).fetchone()
+        if not row and fp:   # cookie মুছলেও একই fingerprint = একই device
+            row = conn.execute("SELECT id, status, note FROM user_devices WHERE user_id=? AND fp=? "
+                               "ORDER BY (status='approved') DESC LIMIT 1", (user_id, fp)).fetchone()
+        if row:
+            status, note = row[1], row[2] or ''
+            conn.execute("UPDATE user_devices SET device_id=?, last_seen=?, ip=?, fp=COALESCE(NULLIF(?, ''), fp) WHERE id=?",
+                         (did, ts, _client_ip(), fp, row[0]))
+        else:
+            n = conn.execute("SELECT COUNT(*) FROM user_devices WHERE user_id=? AND status='approved'", (user_id,)).fetchone()[0]
+            if not enabled or n == 0:
+                status = 'approved'
+            elif n >= max_dev:
+                status, note = 'blocked', 'limit'
+            else:
+                status = 'pending'
+            conn.execute('INSERT INTO user_devices (user_id, device_id, label, ip, status, first_seen, last_seen, fp, note) '
+                         'VALUES (?,?,?,?,?,?,?,?,?)',
+                         (user_id, did, (request.headers.get('User-Agent') or '')[:160] or 'unknown',
+                          _client_ip(), status, ts, ts, fp, note))
+        conn.commit()
+    finally:
+        conn.close()
+    if status == 'approved':
+        _DEV_CACHE[key] = (status, now)
+    return status, note
+
+
+def device_status(user_id):
+    return device_state(user_id)[0]
+
+
+@app.before_request
+def _device_guard():
+    _ensure_device_id()
+    if request.endpoint == 'static':
+        return
+    uid = session.get('user_id')
+    if uid is None or uid < 0 or session.get('is_admin') or session.get('owner_mode'):
+        return
+    if dev_setting('enabled') != '1':
+        return
+    if request.path.endswith('logout') or request.path in ('/login', '/agent/login'):
+        return
+    if device_status(uid) == 'approved':
+        return
+    session.clear()
+    if request.path.startswith('/api/'):
+        return jsonify({'error': '⛔ এই device approved না। আবার login করুন।'}), 401
+    flash('⛔ এই device approved নয় — Owner-এর approval লাগবে।', 'error')
+    return redirect(url_for('login'))
+
+
+_FP_SCRIPT = r"""<script>
+(function(){try{
+ function h(s){var a=0xdeadbeef,b=0x41c6ce57,c;for(var i=0;i<s.length;i++){c=s.charCodeAt(i);a=Math.imul(a^c,2654435761);b=Math.imul(b^c,1597334677);}
+  a=Math.imul(a^(a>>>16),2246822507)^Math.imul(b^(b>>>13),3266489909);b=Math.imul(b^(b>>>16),2246822507)^Math.imul(a^(a>>>13),3266489909);
+  return (4294967296*(2097151&b)+(a>>>0)).toString(16);}
+ var cs='';
+ try{var cv=document.createElement('canvas');cv.width=220;cv.height=40;var x=cv.getContext('2d');x.textBaseline='top';x.font='16px Arial';
+  x.fillStyle='#f60';x.fillRect(10,5,100,25);x.fillStyle='#069';x.fillText('Mahir-FP-\u2603-Cwm',12,8);
+  x.fillStyle='rgba(102,204,0,0.7)';x.fillText('Mahir-FP-\u2603-Cwm',14,10);cs=cv.toDataURL();}catch(e){}
+ var tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'';}catch(e){}
+ var p=[navigator.userAgent,navigator.language,navigator.platform,screen.width+'x'+screen.height+'x'+screen.colorDepth,
+  window.devicePixelRatio||1,tz,new Date().getTimezoneOffset(),navigator.hardwareConcurrency||0,h(cs)].join('||');
+ var fp=h(p)+h('m'+p);
+ document.cookie='mahir_fp='+fp+';path=/;max-age=63072000;SameSite=Lax';
+ function put(){var f=document.forms;for(var i=0;i<f.length;i++){if(f[i].querySelector('input[name=fp]'))continue;
+  var inp=document.createElement('input');inp.type='hidden';inp.name='fp';inp.value=fp;f[i].appendChild(inp);}}
+ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',put);else put();
+}catch(e){}})();
+</script>"""
+
+
+@app.after_request
+def _device_after(resp):
+    try:
+        if getattr(g, 'set_device_cookie', False) and getattr(g, 'device_id', None):
+            secure = _is_https()
+            resp.set_cookie('mahir_did', g.device_id, max_age=60 * 60 * 24 * 730,
+                            httponly=True, samesite='Lax', secure=secure)
+        if (request.path in ('/login', '/register', '/agent/login') and resp.status_code == 200
+                and (resp.mimetype or '') == 'text/html' and not resp.direct_passthrough):
+            html = resp.get_data(as_text=True)
+            html = html.replace('</body>', _FP_SCRIPT + '</body>', 1) if '</body>' in html else html + _FP_SCRIPT
+            resp.set_data(html)
+    except Exception:
+        pass
+    return resp
+
+
+def device_gate(user_id):
+    """Login-এর সময়: approved হলে True; নাহলে কারণসহ flash দিয়ে False।"""
+    st, note = device_state(user_id)
+    if st == 'approved':
+        return True
+    if st == 'blocked' and note == 'limit':
+        flash('⛔ Device limit পূর্ণ — আপনার সর্বোচ্চ device সংখ্যা ব্যবহার হয়ে গেছে। Owner-এর সাথে যোগাযোগ করুন। '
+              f'(Device ID: {g.device_id[:8]})', 'error')
+    elif st == 'blocked':
+        flash('⛔ এই device block করা আছে। Owner-এর সাথে যোগাযোগ করুন।', 'error')
+    else:
+        flash('🔐 নতুন device শনাক্ত হয়েছে। Owner approve করলে তারপর login করতে পারবেন। '
+              f'(Device ID: {g.device_id[:8]})', 'error')
+    return False
+
+
+def _scope_users():
+    """{id: (username, is_agent)} — Owner সবাই; Agent শুধু নিজের তৈরি user।"""
+    conn = get_db_connection()
+    try:
+        if session.get('is_admin'):
+            rows = conn.execute('SELECT id, username, is_agent FROM users WHERE is_admin=0').fetchall()
+        else:
+            rows = conn.execute('SELECT id, username, is_agent FROM users WHERE created_by_agent=? AND is_admin=0 AND is_agent=0',
+                                (session.get('username'),)).fetchall()
+    finally:
+        conn.close()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+DEVICES_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Device Verification</title>
+<style>
+body{margin:0;padding:16px;background:#0e0e14;color:#eee;font-family:system-ui,sans-serif}
+h2{margin:0 0 12px}h3{margin:18px 0 8px}a{color:#6cf}
+.card{background:#171722;border:1px solid #2a2a3a;border-radius:12px;padding:12px;margin-bottom:10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between}
+.tag{padding:2px 10px;border-radius:99px;font-size:12px;font-weight:700}
+.approved{background:#12351f;color:#4be37f}.pending{background:#3a2f0b;color:#ffd24a}.blocked{background:#3a1220;color:#ff6b8a}
+button{border:0;border-radius:8px;padding:6px 12px;font-weight:700;cursor:pointer;color:#111}
+.b-ok{background:#4be37f}.b-no{background:#ff6b8a}.b-del{background:#aaa}.b-rst{background:#ffd24a}.b-go{background:#6cf}
+small{color:#9a9ab0;word-break:break-all}
+input[type=number],input[type=text]{background:#0e0e14;color:#eee;border:1px solid #333;border-radius:8px;padding:6px 8px}
+label{margin-right:14px}.tabs a{margin-right:8px;text-decoration:none;padding:4px 10px;border-radius:99px;background:#222;display:inline-block;margin-bottom:6px}
+.tabs a.on{background:#6cf;color:#111}
+</style></head><body>
+<h2>🛡 Device Verification</h2>
+<p><a href="{{ back }}">← Back</a></p>
+{% with m = get_flashed_messages() %}{% for x in m %}<div class="card">{{ x }}</div>{% endfor %}{% endwith %}
+{% if is_owner %}
+<div class="card"><form method="post" action="/owner/devices/settings">
+  <b>Settings</b><br><br>
+  <label><input type="checkbox" name="enabled" {% if st.enabled == '1' %}checked{% endif %}> Device verification চালু</label><br><br>
+  <label>প্রতি user সর্বোচ্চ trusted device: <input type="number" name="max_devices" min="1" max="50" value="{{ st.max_devices }}" style="width:70px"></label>
+  <button class="b-go" type="submit">Save</button><br>
+  <small>প্রথম device auto-trust · লিমিট পূর্ণ হলে নতুন device auto-block · লিমিটের নিচে হলে Pending (আপনি Trust করবেন)</small>
+</form></div>
+{% endif %}
+<div class="tabs">
+  {% for k,l in tabs %}<a class="{{ 'on' if f == k else '' }}" href="?s={{ k }}&q={{ q }}">{{ l }}</a>{% endfor %}
+  <form method="get" style="display:inline"><input type="hidden" name="s" value="{{ f }}"><input type="text" name="q" value="{{ q }}" placeholder="username খুঁজুন"> <button class="b-go">Search</button></form>
+</div>
+{% if not rows %}<div class="card">কোনো device নেই।</div>{% endif %}
+{% for r in rows %}
+<div class="card"><div class="row">
+  <div><b>{{ r.username }}</b>{% if r.is_agent %} (agent){% endif %} <span class="tag {{ r.status }}">{{ 'trusted' if r.status == 'approved' else r.status }}</span>{% if r.note == 'limit' %} <small>(limit পূর্ণ)</small>{% endif %}<br>
+  <small>{{ r.ip }} · first {{ r.first_seen }} · last {{ r.last_seen }}<br>{{ r.label }}<br>ID {{ r.device_id[:8] }} · FP {{ (r.fp or '-')[:8] }}</small></div>
+  <form method="post" action="/devices/action" style="display:flex;gap:6px;flex-wrap:wrap">
+    <input type="hidden" name="kind" value="reg"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="back" value="{{ back_self }}">
+    {% if r.status != 'approved' %}<button class="b-ok" name="act" value="approve">Trust</button>{% endif %}
+    {% if r.status != 'blocked' %}<button class="b-no" name="act" value="block">Block</button>{% endif %}
+    <button class="b-del" name="act" value="delete" onclick="return confirm('Delete?')">Delete</button>
+    <button class="b-rst" name="act" value="reset_user" onclick="return confirm('এই user-এর সব device মুছবেন? পরের login-এর device আবার প্রথম হিসেবে trust হবে।')">Reset user</button>
+  </form></div></div>
+{% endfor %}
+<h3>🔐 Auto-login (Verify this device চাপা)</h3>
+{% if not tokens %}<div class="card">কোনো auto-login device নেই।</div>{% endif %}
+{% for r in tokens %}
+<div class="card"><div class="row">
+  <div><b>{{ r.username }}</b> <small>({{ r.role }})</small><br>
+  <small>{{ r.ip }} · verified {{ r.created_at }} · last used {{ r.last_used }} · expires {{ r.expires_at }}<br>{{ r.label }}</small></div>
+  <form method="post" action="/devices/action" style="display:flex;gap:6px;flex-wrap:wrap">
+    <input type="hidden" name="kind" value="tok"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="back" value="{{ back_self }}">
+    <button class="b-del" name="act" value="delete">Remove</button>
+    <button class="b-rst" name="act" value="reset_user" onclick="return confirm('এই user-এর সব auto-login device মুছবেন?')">Remove all of user</button>
+  </form></div></div>
+{% endfor %}</body></html>"""
+
+
+def _devices_page(back, back_self):
+    f = request.args.get('s', 'all')
+    q = (request.args.get('q') or '').strip().lower()
+    scope = _scope_users()
+    rows, counts = [], {'all': 0, 'pending': 0, 'approved': 0, 'blocked': 0}
+    tokens = []
+    dc = _dev_conn()
+    try:
+        if scope:
+            qs = ','.join('?' * len(scope))
+            order = "CASE status WHEN 'pending' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END, last_seen DESC"
+            for r in dc.execute(f'SELECT id,user_id,device_id,label,ip,status,first_seen,last_seen,fp,note FROM user_devices '
+                                f'WHERE user_id IN ({qs}) ORDER BY {order}', list(scope.keys())).fetchall():
+                name = scope[r[1]][0]
+                if q and q not in name.lower():
+                    continue
+                counts['all'] += 1
+                counts[r[5]] = counts.get(r[5], 0) + 1
+                if f != 'all' and r[5] != f:
+                    continue
+                rows.append({'id': r[0], 'username': name, 'is_agent': scope[r[1]][1], 'device_id': r[2], 'label': r[3],
+                             'ip': r[4], 'status': r[5], 'first_seen': r[6], 'last_seen': r[7], 'fp': r[8], 'note': r[9]})
+        scope_ids = None if session.get('is_admin') else set(scope.keys())
+        for r in dc.execute('SELECT id,user_id,username,role,ip,label,created_at,last_used,expires_at FROM trusted_devices ORDER BY last_used DESC').fetchall():
+            if scope_ids is None or r[1] in scope_ids:
+                tokens.append(dict(zip(('id', 'user_id', 'username', 'role', 'ip', 'label', 'created_at', 'last_used', 'expires_at'), r)))
+    finally:
+        dc.close()
+    tabs = [('all', f"All ({counts['all']})"), ('pending', f"Pending ({counts['pending']})"),
+            ('approved', f"Trusted ({counts['approved']})"), ('blocked', f"Blocked ({counts['blocked']})")]
+    return render_template_string(DEVICES_HTML, rows=rows, tokens=tokens, back=back, back_self=back_self,
+                                  is_owner=bool(session.get('is_admin')), st={k: dev_setting(k) for k in DEV_DEFAULTS},
+                                  tabs=tabs, f=f, q=q)
+
+
+@app.route('/owner/devices')
+@owner_required
+def owner_devices():
+    return _devices_page('/owner/dashboard', '/owner/devices')
+
+
+@app.route('/agent/devices')
+@agent_required
+def agent_devices():
+    return _devices_page('/agent/dashboard', '/agent/devices')
+
+
+@app.route('/owner/devices/settings', methods=['POST'])
+@owner_required
+def owner_devices_settings():
+    set_dev_setting('enabled', '1' if request.form.get('enabled') else '0')
+    try:
+        mx = min(50, max(1, int(request.form.get('max_devices', 2))))
+    except ValueError:
+        mx = 2
+    set_dev_setting('max_devices', mx)
+    _DEV_CACHE.clear()
+    flash('✅ Device settings saved', 'success')
+    return redirect('/owner/devices')
+
+
+@app.route('/api/devices/pending')
+def api_devices_pending():
+    if not (session.get('is_admin') or session.get('is_agent')):
+        return jsonify({'count': 0})
+    scope = _scope_users()
+    if not scope:
+        return jsonify({'count': 0})
+    dc = _dev_conn()
+    try:
+        qs = ','.join('?' * len(scope))
+        n = dc.execute(f"SELECT COUNT(*) FROM user_devices WHERE status='pending' AND user_id IN ({qs})", list(scope.keys())).fetchone()[0]
+    finally:
+        dc.close()
+    return jsonify({'count': n})
+
+
+@app.route('/devices/action', methods=['POST'])
+def devices_action():
+    if not (session.get('is_admin') or session.get('is_agent')):
+        return redirect(url_for('login'))
+    back = request.form.get('back')
+    if back not in ('/owner/devices', '/agent/devices'):
+        back = '/owner/devices' if session.get('is_admin') else '/agent/devices'
+    try:
+        dev_id = int(request.form.get('id', 0))
+    except ValueError:
+        return redirect(back)
+    kind = request.form.get('kind', 'reg')
+    act = request.form.get('act')
+    scope = _scope_users()
+    table = 'trusted_devices' if kind == 'tok' else 'user_devices'
+    dc = _dev_conn()
+    try:
+        row = dc.execute(f'SELECT user_id FROM {table} WHERE id=?', (dev_id,)).fetchone()
+        if not row or (row[0] not in scope and not (session.get('is_admin') and kind == 'tok')):
+            flash('Not allowed', 'error')
+            return redirect(back)
+        uid = row[0]
+        if kind == 'tok':
+            if act == 'reset_user':
+                dc.execute('DELETE FROM trusted_devices WHERE user_id=?', (uid,))
+            else:
+                dc.execute('DELETE FROM trusted_devices WHERE id=?', (dev_id,))
+        elif act == 'approve':
+            dc.execute("UPDATE user_devices SET status='approved', note='' WHERE id=?", (dev_id,))
+        elif act == 'block':
+            dc.execute("UPDATE user_devices SET status='blocked', note='' WHERE id=?", (dev_id,))
+            dc.execute('DELETE FROM trusted_devices WHERE user_id=?', (uid,))   # block করলে auto-login টোকেনও বাতিল
+        elif act == 'delete':
+            dc.execute('DELETE FROM user_devices WHERE id=?', (dev_id,))
+        elif act == 'reset_user':
+            dc.execute('DELETE FROM user_devices WHERE user_id=?', (uid,))
+        dc.commit()
+    finally:
+        dc.close()
+    _DEV_CACHE.clear()
+    flash('✅ Done', 'success')
+    return redirect(back)
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -5889,6 +6893,11 @@ def login():
         user = c.fetchone()
         conn.close()
         if user and check_password(user[2], password):
+            if not user[3] and not device_gate(user[0]):
+                return render_template_string(LOGIN_HTML, **_auth_page_ctx())
+            maybe_upgrade_password(user[0], user[2], password)
+            log.info("auth: login ok user_id=%s ip=%s", user[0], _client_ip())
+            session.clear()
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_admin'] = bool(user[3]); session['is_agent'] = bool(user[4])
             session.permanent = True
@@ -5897,6 +6906,7 @@ def login():
             if session['is_admin']: return redirect(url_for('owner_dashboard'))
             elif session['is_agent']: return redirect(url_for('agent_dashboard'))
             else: return redirect(url_for('user_dashboard'))
+        log.warning("auth: login failed ip=%s", _client_ip())
         flash('Invalid credentials', 'error')
     return render_template_string(LOGIN_HTML, **_auth_page_ctx())
 
@@ -5932,7 +6942,14 @@ def register():
         c.execute('''INSERT INTO users (username, password, email, registration_key, is_admin, is_agent, subscription_expiry, created_by_agent)
                      VALUES (?, ?, ?, ?, 0, 0, ?, ?)''', (username, password, email, reg_key, key_row[1], agent_name))
         c.execute('UPDATE keys SET is_used=1, used_by=?, used_at=CURRENT_TIMESTAMP WHERE key=?', (username, reg_key))
-        conn.commit(); conn.close()
+        conn.commit()
+        try:
+            _row = conn.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone()
+            if _row:
+                device_status(_row[0])
+        except Exception as _e:
+            print(f"[register-device] {_e}")
+        conn.close()
         flash('Registration successful!', 'success')
         return redirect(url_for('login'))
     return render_template_string(REGISTER_HTML, **_auth_page_ctx())
@@ -5949,7 +6966,7 @@ def recover():
         row = c.fetchone()
         if row:
             stored = row[0]
-            if is_hashed(stored):
+            if is_hashed_any(stored):
                 new_pw = secrets.token_hex(8)
                 c.execute('UPDATE users SET password=? WHERE username=?', (new_pw, username))
                 conn.commit(); conn.close()
@@ -5981,10 +6998,16 @@ def agent_login():
         user = c.fetchone()
         conn.close()
         if user and user[3] == 1 and check_password(user[2], password):
+            if not device_gate(user[0]):
+                return render_template_string(AGENT_LOGIN_HTML, **_auth_page_ctx())
+            maybe_upgrade_password(user[0], user[2], password)
+            log.info("auth: agent login ok user_id=%s ip=%s", user[0], _client_ip())
+            session.clear()
             session['user_id'] = user[0]; session['username'] = user[1]
             session['is_agent'] = True; session['is_admin'] = False
             session.permanent = True
             return redirect(url_for('agent_dashboard'))
+        log.warning("auth: agent login failed ip=%s", _client_ip())
         flash('Invalid', 'error')
     return render_template_string(AGENT_LOGIN_HTML, **_auth_page_ctx())
 
@@ -6269,11 +7292,24 @@ def agent_logout():
 @agent_required
 def agent_download_db():
     password = request.form.get('db_password', '')
-    if password != DB_DOWNLOAD_PASSWORD:
+    if not hmac.compare_digest(password.encode(), DB_DOWNLOAD_PASSWORD.encode()):
+        log.warning("auth: db download wrong password user_id=%s ip=%s", session.get('user_id'), _client_ip())
         flash('❌ Wrong DB password!', 'error')
         return redirect(url_for('agent_dashboard'))
+    log.info("db download by user_id=%s ip=%s", session.get('user_id'), _client_ip())
     if os.path.exists(DB_FILE):
-        return send_file(DB_FILE, as_attachment=True)
+        snap = tempfile.NamedTemporaryFile(delete=False, suffix='.db'); snap.close()
+        try:
+            _s = sqlite3.connect(DB_FILE, timeout=30); _d = sqlite3.connect(snap.name)
+            _s.backup(_d); _d.close(); _s.close()
+        except Exception as e:
+            log.error("db snapshot failed: %s", e)
+            os.path.exists(snap.name) and os.remove(snap.name)
+            flash('❌ DB snapshot failed', 'error')
+            return redirect(url_for('agent_dashboard'))
+        resp = send_file(snap.name, as_attachment=True, download_name=os.path.basename(DB_FILE))
+        resp.call_on_close(lambda: os.path.exists(snap.name) and os.remove(snap.name))
+        return resp
     flash('❌ DB file not found', 'error')
     return redirect(url_for('agent_dashboard'))
 
@@ -6383,7 +7419,9 @@ def owner_login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        if username == OWNER_USERNAME and password == OWNER_PASSWORD:
+        if (hmac.compare_digest(username.encode(), OWNER_USERNAME.encode())
+                and hmac.compare_digest(password.encode(), OWNER_PASSWORD.encode())):
+            log.info("auth: owner login ok ip=%s", _client_ip())
             session.clear()
             session['user_id'] = -1
             session['username'] = 'OWNER'
@@ -6394,6 +7432,7 @@ def owner_login():
             session['just_logged_in'] = True
             session['voice_name'] = 'Owner Mahir'
             return redirect(url_for('owner_dashboard'))
+        log.warning("auth: owner login failed ip=%s", _client_ip())
         flash('Invalid owner credentials', 'error')
     return render_template_string(OWNER_LOGIN_HTML, **_auth_page_ctx())
 
@@ -6812,8 +7851,8 @@ def owner_start_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
     set_setting('global_bot_stop', '0')
-    success, fail = reset_all_bots()
-    flash(f'✅ Global stop OFF! Rebuilt + {success} bots started.', 'success')
+    started = reset_all_bots_async()
+    flash('✅ Global stop OFF! Rebuild + bot start ব্যাকগ্রাউন্ডে চলছে।' if started else '⏳ আগের Reset চলছে।', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -7848,6 +8887,19 @@ def cleanup_trial_keys():
 
 
 # ========== FILE MANAGER (owner only) ==========
+_PROTECTED_FILES = {'.secret_key'}
+
+
+def _path_ok(fp):
+    base = os.path.realpath(os.getcwd())
+    real = os.path.realpath(fp)
+    try:
+        inside = os.path.commonpath([base, real]) == base
+    except ValueError:
+        return False
+    return inside and os.path.basename(real) not in _PROTECTED_FILES
+
+
 @app.route('/owner/files', defaults={'path': ''})
 @app.route('/owner/files/<path:path>')
 def owner_file_manager(path):
@@ -7857,7 +8909,7 @@ def owner_file_manager(path):
         flash('Invalid', 'error')
         return redirect(url_for('owner_dashboard'))
     current_dir = os.path.join(os.getcwd(), path) if path else os.getcwd()
-    if not os.path.exists(current_dir) or not os.path.isdir(current_dir):
+    if not _path_ok(current_dir) or not os.path.exists(current_dir) or not os.path.isdir(current_dir):
         flash('Not found', 'error')
         return redirect(url_for('owner_dashboard'))
     parent_dir = None
@@ -7893,6 +8945,9 @@ def owner_edit_file(path):
     if '..' in path or path.startswith('/'):
         return jsonify({'error': 'Invalid'}), 400
     fp = os.path.join(os.getcwd(), path)
+    if not _path_ok(fp):
+        log.warning("file access blocked: %s", path)
+        return jsonify({'error': 'Invalid'}), 400
     if not os.path.exists(fp) or os.path.isdir(fp):
         return jsonify({'error': 'Not found'}), 404
     if request.method == 'GET':
@@ -7916,6 +8971,9 @@ def owner_delete_file(path):
     if '..' in path or path.startswith('/'):
         return jsonify({'error': 'Invalid'}), 400
     fp = os.path.join(os.getcwd(), path)
+    if not _path_ok(fp):
+        log.warning("file access blocked: %s", path)
+        return jsonify({'error': 'Invalid'}), 400
     if not os.path.exists(fp) or os.path.isdir(fp):
         return jsonify({'error': 'Not found'}), 404
     try:
@@ -7933,6 +8991,9 @@ def owner_download_file(path):
         flash('Invalid', 'error')
         return redirect(url_for('owner_dashboard'))
     fp = os.path.join(os.getcwd(), path)
+    if not _path_ok(fp):
+        flash('Invalid', 'error')
+        return redirect(url_for('owner_dashboard'))
     if not os.path.exists(fp) or os.path.isdir(fp):
         flash('Not found', 'error')
         return redirect(url_for('owner_dashboard'))
@@ -7973,6 +9034,12 @@ def owner_upload_file():
             if safe_name.lower().endswith('.zip'):
                 try:
                     with zipfile.ZipFile(fp, 'r') as z:
+                        infos = z.infolist()
+                        if len(infos) > 5000 or sum(i.file_size for i in infos) > 500 * 1024 * 1024:
+                            raise zipfile.BadZipFile('archive too large')
+                        for i in infos:
+                            if not _path_ok(os.path.join(target_dir, i.filename)):
+                                raise zipfile.BadZipFile('unsafe path in archive')
                         z.extractall(target_dir)
                     os.remove(fp)
                     zip_list.append(safe_name)
@@ -8016,19 +9083,12 @@ def owner_upload_mahir():
     # Save new template
     file.save(MAHIR_SOURCE)
 
-    # ✅ Rebuild all bot files with new template + DB creds + delete expired
-    result = rebuild_all_bot_files(delete_expired=True)
-
-    # ✅ Start all eligible bots
-    success, fail, skipped = _start_all_eligible_bots()
-
-    flash(
-        f'✅ mahir.py updated! '
-        f'Bots rebuilt: {result["updated"]}, '
-        f'Expired deleted: {result["deleted_expired"]}, '
-        f'Started: {success}, Failed: {fail}, Skipped: {skipped}',
-        'success'
-    )
+    # ✅ Rebuild + rolling start ব্যাকগ্রাউন্ডে (server freeze এড়াতে)
+    if reset_all_bots_async():
+        flash('✅ mahir.py আপলোড হয়েছে। Bot rebuild + একটা একটা করে restart ব্যাকগ্রাউন্ডে চলছে — '
+              'শেষ হলে /api/owner/reset_status এ দেখতে পারবেন।', 'success')
+    else:
+        flash('⏳ আগের Reset এখনো চলছে। শেষ হওয়ার পর আবার চেষ্টা করুন (mahir.py সেভ হয়েছে)।', 'error')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8072,19 +9132,11 @@ def _handle_db_upload(redirect_endpoint):
         flash(f'❌ Replace error: {e}', 'error')
         return redirect(url_for(redirect_endpoint))
 
-    # ✅ Rebuild all bot files from new DB + fresh mahir.py + delete expired
-    result = rebuild_all_bot_files(delete_expired=True)
-
-    # ✅ Start all eligible bots
-    success, fail, skipped = _start_all_eligible_bots()
-
-    flash(
-        f'✅ DB uploaded! '
-        f'Bots rebuilt: {result["updated"]}, '
-        f'Expired deleted: {result["deleted_expired"]}, '
-        f'Started: {success}, Failed: {fail}, Skipped: {skipped}',
-        'success'
-    )
+    # ✅ Rebuild + rolling start ব্যাকগ্রাউন্ডে
+    if reset_all_bots_async():
+        flash('✅ DB আপলোড হয়েছে। Bot rebuild + restart ব্যাকগ্রাউন্ডে চলছে।', 'success')
+    else:
+        flash('⏳ আগের Reset এখনো চলছে। DB সেভ হয়েছে।', 'error')
     return redirect(url_for(redirect_endpoint))
 
 
@@ -8099,8 +9151,9 @@ def owner_upload_users_db():
 def owner_reset_all_bots():
     if not session.get('is_admin'):
         return redirect(url_for('owner_login'))
-    success, fail = reset_all_bots()
-    flash(f'🔄 Reset complete: {success} bots started, {fail} failed. All bot files were rebuilt from mahir.py + DB creds, expired files deleted.', 'success')
+    started = reset_all_bots_async()
+    flash('🔄 Reset ব্যাকগ্রাউন্ডে শুরু হয়েছে — bot গুলো একটা একটা করে চালু হবে। অগ্রগতি: /api/owner/reset_status' if started
+          else '⏳ আগের Reset এখনো চলছে।', 'success')
     return redirect(url_for('owner_dashboard'))
 
 
@@ -8165,7 +9218,8 @@ def api_owner_force_all_login():
             'message': 'Missing params: owner_user and owner_pass required'
         }), 400
 
-    if owner_user != OWNER_USERNAME or owner_pass != OWNER_PASSWORD:
+    if not (hmac.compare_digest(str(owner_user).encode(), OWNER_USERNAME.encode())
+            and hmac.compare_digest(str(owner_pass).encode(), OWNER_PASSWORD.encode())):
         return jsonify({
             'status': 'error',
             'message': 'Invalid owner credentials'
@@ -8790,7 +9844,6 @@ if __name__ == '__main__':
     ║       Port: 8080  |  Owner Panel: /owner/login           ║
     ║       Agent Panel: /agent/login                          ║
     ║       Owner Login: /owner/login                                 ║
-    ║       DB Download Password: MAHIRDB                      ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
